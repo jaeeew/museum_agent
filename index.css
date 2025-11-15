@@ -1,0 +1,8 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 추가 확인용 — 배경 기본 색상 지정 (하얀 화면 구분용) */
+body {
+  background-color: #f9fafb;
+}
