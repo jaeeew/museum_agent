@@ -9,16 +9,20 @@ export default function Gallery() {
   const [loading, setLoading] = useState(true)
   const itemsPerPage = 20
 
-  // 🆕 비교 모드 & 선택 상태
+  // 비교 모드 & 선택 상태 (최대 2개)
   const [compareMode, setCompareMode] = useState(false)
-  const [selected, setSelected] = useState([]) // [id, id]
+  const [selected, setSelected] = useState([]) // compare: 0~2개, tour: 0~1개
 
+  // 투어 모드 (카드 하나만 선택)
+  const [tourMode, setTourMode] = useState(false)
+
+  //이미지 경로 바꿔주세요
   const jsonBase = "http://localhost:8080/json_extracted"
   const apiBase = "http://localhost:8080/json_list"
   const findImageAPI = "http://localhost:8080/find_image"
   const navigate = useNavigate()
 
-  // ✅ 1️⃣ 카테고리별 JSON 목록 가져오기
+  // 1️⃣ 카테고리별 JSON 파일 목록 로드
   useEffect(() => {
     const loadList = async () => {
       try {
@@ -36,7 +40,7 @@ export default function Gallery() {
     loadList()
   }, [category])
 
-  // ✅ 2️⃣ 현재 페이지의 JSON 데이터 로드
+  // 2️⃣ 현재 페이지의 JSON들 로드해서 카드 데이터 만들기
   useEffect(() => {
     const loadPage = async () => {
       if (!allFiles.length) return
@@ -51,7 +55,6 @@ export default function Gallery() {
             if (!res.ok) throw new Error("JSON 로드 실패: " + file)
             const json = await res.json()
 
-            // ✅ 작품명, 작가명 자동 추출 (Description 내부 포함)
             const desc = json.Description || {}
             const title =
               desc.ArtTitle_kor ||
@@ -64,7 +67,7 @@ export default function Gallery() {
               json.artist ||
               "작가 미상"
 
-            // ✅ 이미지 탐색 (서버 API 이용)
+            // 이미지 불러오는 서버
             const prefix = file.replace(/\.[^/.]+$/, "")
             let imgUrl = null
             try {
@@ -93,32 +96,62 @@ export default function Gallery() {
     loadPage()
   }, [allFiles, page, category])
 
-  const totalPages = Math.ceil(allFiles.length / itemsPerPage)
+  const totalPages = Math.ceil(allFiles.length / itemsPerPage) || 1
 
-  // 🆕 카드 클릭 동작 (비교 모드에 따라 분기)
+  // 🔘 카드 클릭 동작
   const handleCardClick = (item) => {
-    if (!compareMode) {
-      navigate(`/detail/${encodeURIComponent(item.id)}?category=${category}`)
+    // 🟢 투어 모드: 하나만 선택 (같은 카드 다시 누르면 해제)
+    if (tourMode) {
+      setSelected((prev) =>
+        prev[0] === item.id ? [] : [item.id]
+      )
       return
     }
-    setSelected((prev) => {
-      const exists = prev.includes(item.id)
-      if (exists) return prev.filter((id) => id !== item.id)
-      if (prev.length >= 2) return prev // 최대 2개
-      return [...prev, item.id]
-    })
+
+    // 🟣 비교 모드: 최대 2개 선택
+    if (compareMode) {
+      setSelected((prev) => {
+        const exists = prev.includes(item.id)
+        if (exists) return prev.filter((id) => id !== item.id)
+        if (prev.length >= 2) return prev
+        return [...prev, item.id]
+      })
+      return
+    }
+
+    // 기본: 상세 페이지로 이동
+    navigate(`/detail/${encodeURIComponent(item.id)}?category=${category}`)
   }
 
-  // 🆕 비교하기 실행
+  // 🆚 두 작품 비교하기 실행
   const handleCompare = () => {
     if (selected.length !== 2) return
     const [a, b] = selected
-    navigate(`/compare?ids=${encodeURIComponent(a)},${encodeURIComponent(b)}&category=${category}`)
+    navigate(
+      `/compare?ids=${encodeURIComponent(a)},${encodeURIComponent(
+        b
+      )}&category=${category}`
+    )
   }
 
-  // 🆕 비교 모드 토글 시 선택 초기화
+  // 🧭 투어 시작 실행 (선택된 1개로 투어 페이지 이동)
+  const handleTourStart = () => {
+    if (selected.length !== 1) return
+    const id = selected[0]
+    navigate(`/tour/${encodeURIComponent(id)}?category=${category}`)
+  }
+
+  // 비교 모드 토글
   const toggleCompareMode = () => {
     setCompareMode((v) => !v)
+    setTourMode(false)
+    setSelected([])
+  }
+
+  // 투어 모드 토글
+  const toggleTourMode = () => {
+    setTourMode((v) => !v)
+    setCompareMode(false)
     setSelected([])
   }
 
@@ -128,9 +161,9 @@ export default function Gallery() {
         🎨 {category.replace("_json", "").toUpperCase()} GALLERY
       </h1>
 
-      {/* 카테고리 + 비교 컨트롤 */}
+      {/* 상단 컨트롤 영역 */}
       <div className="flex flex-col gap-3 items-center mb-6">
-        <div className="flex justify-center gap-4">
+        <div className="flex flex-wrap justify-center gap-4">
           {["craft_json", "painting_json", "sculpture_json"].map((cat) => (
             <button
               key={cat}
@@ -138,6 +171,7 @@ export default function Gallery() {
                 setCategory(cat)
                 setSelected([])
                 setCompareMode(false)
+                setTourMode(false)
               }}
               className={`px-4 py-2 rounded-2xl transition ${
                 category === cat
@@ -149,7 +183,7 @@ export default function Gallery() {
             </button>
           ))}
 
-          {/* 🆕 두 작품 비교하기 버튼 */}
+          {/* 🆚 두 작품 비교하기 버튼 */}
           <button
             onClick={toggleCompareMode}
             className={`px-4 py-2 rounded-2xl transition border ${
@@ -160,9 +194,21 @@ export default function Gallery() {
           >
             🆚 두 작품 비교하기
           </button>
+
+          {/* 🧭 투어 모드 버튼 (1개 선택) */}
+          <button
+            onClick={toggleTourMode}
+            className={`px-4 py-2 rounded-2xl transition border ${
+              tourMode
+                ? "bg-green-600 text-white border-green-600"
+                : "bg-white text-green-600 border-green-400 hover:bg-green-50"
+            }`}
+          >
+            🧭 투어 모드 (1개 선택)
+          </button>
         </div>
 
-        {/* 🆕 비교 모드 상태바 */}
+        {/* 비교 모드 상태바 */}
         {compareMode && (
           <div className="flex items-center gap-3">
             <span className="text-sm text-gray-600">
@@ -173,11 +219,37 @@ export default function Gallery() {
               disabled={selected.length !== 2}
               className={`px-4 py-2 rounded-xl transition ${
                 selected.length === 2
-                  ? "bg-green-600 text-white hover:bg-green-700"
+                  ? "bg-purple-600 text-white hover:bg-purple-700"
                   : "bg-gray-200 text-gray-500 cursor-not-allowed"
               }`}
             >
               비교하기
+            </button>
+            <button
+              onClick={() => setSelected([])}
+              className="px-3 py-2 text-sm bg-gray-100 rounded-xl hover:bg-gray-200"
+            >
+              선택 초기화
+            </button>
+          </div>
+        )}
+
+        {/* 투어 모드 상태바 */}
+        {tourMode && (
+          <div className="flex items-center gap-3">
+            <span className="text-sm text-gray-600">
+              투어 작품 선택 {selected.length} / 1
+            </span>
+            <button
+              onClick={handleTourStart}
+              disabled={selected.length !== 1}
+              className={`px-4 py-2 rounded-xl transition ${
+                selected.length === 1
+                  ? "bg-green-600 text-white hover:bg-green-700"
+                  : "bg-gray-200 text-gray-500 cursor-not-allowed"
+              }`}
+            >
+              투어 시작
             </button>
             <button
               onClick={() => setSelected([])}
@@ -196,30 +268,30 @@ export default function Gallery() {
         </div>
       ) : (
         <>
-          {/* 카드뷰 */}
+          {/* 카드 그리드 */}
           <div className="grid grid-cols-5 gap-6">
             {pageItems.map((item, idx) => {
               const isSelected = selected.includes(item.id)
+
+              let ringClass = ""
+              if (compareMode && isSelected) ringClass = "ring-2 ring-purple-500"
+              if (tourMode && isSelected) ringClass = "ring-2 ring-green-500"
+
               return (
                 <div
                   key={idx}
                   onClick={() => handleCardClick(item)}
                   className={`relative border rounded-2xl shadow transition p-3 flex flex-col items-center cursor-pointer ${
-                    compareMode
-                      ? isSelected
-                        ? "ring-2 ring-purple-500"
-                        : "hover:shadow-lg"
-                      : "hover:shadow-lg"
+                    ringClass || "hover:shadow-lg"
                   }`}
                 >
-                  {/* 🆕 체크박스 오버레이 */}
-                  {compareMode && (
+                  {(compareMode || tourMode) && (
                     <div className="absolute top-2 right-2">
                       <input
                         type="checkbox"
                         readOnly
                         checked={isSelected}
-                        className="w-5 h-5 accent-purple-600"
+                        className="w-4 h-4"
                       />
                     </div>
                   )}
@@ -235,11 +307,9 @@ export default function Gallery() {
                       이미지 없음
                     </div>
                   )}
-                  {/* 🔹 작품 이름 */}
                   <p className="text-sm font-semibold text-gray-700 text-center line-clamp-2">
                     {item.meta.title}
                   </p>
-                  {/* 🔹 작가 이름 */}
                   <p className="text-xs text-gray-500">{item.meta.artist}</p>
                 </div>
               )
@@ -255,10 +325,12 @@ export default function Gallery() {
               ◀ 이전
             </button>
             <span className="text-gray-600">
-              {page} / {totalPages || 1}
+              {page} / {totalPages}
             </span>
             <button
-              onClick={() => setPage((p) => Math.min(p + 1, totalPages))}
+              onClick={() =>
+                setPage((p) => Math.min(p + 1, totalPages))
+              }
               className="px-4 py-2 bg-gray-200 rounded-xl hover:bg-gray-300"
             >
               다음 ▶
