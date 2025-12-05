@@ -1,183 +1,571 @@
 import React, { useEffect, useState } from "react"
 import { useParams, useSearchParams, Link } from "react-router-dom"
 
-const NODE_API = "http://localhost:8080"   // JSON/이미지용 Node 서버
-const FAST_API = "http://127.0.0.1:8000"   // AI 설명문용 FastAPI 서버
+const API = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8001"
+
+const CATEGORY_MAP = {
+  painting_json: "TL_01. 2D_02.회화(Json)",
+  craft_json: "TL_01. 2D_04.공예(Json)",
+  sculpture_json: "TL_01. 2D_06.조각(Json)",
+}
 
 export default function Detail() {
   const { id } = useParams()
   const [searchParams] = useSearchParams()
-  const category = searchParams.get("category")
+  const category = searchParams.get("category") || "painting_json"
+  const mode = searchParams.get("mode") || "curate"
 
-  const [data, setData] = useState(null)
+  // ArtworkGrid에서 넘겨준 variants (없을 수도 있음)
+  const variantsParam = searchParams.get("variants")
+
+  const [card, setCard] = useState(null)
   const [imgUrl, setImgUrl] = useState(null)
-  const [curation, setCuration] = useState("")        // 🧠 AI 설명문
-  const [loadingCuration, setLoadingCuration] = useState(false)
-  const [showCuration, setShowCuration] = useState(false) // 펼치기/접기
 
-  // -------------------- 데이터 로드 --------------------
+  const [imageVariants, setImageVariants] = useState([]) // [{id, url}, ...]
+  const [mainImageIndex, setMainImageIndex] = useState(0)
+
+  const [curation, setCuration] = useState("")
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState("")
+
+  // 🔍 유사 작품 추천 상태
+  const [similarItems, setSimilarItems] = useState([])
+  const [similarLoading, setSimilarLoading] = useState(true)
+
+  const realFolder = CATEGORY_MAP[category] || category
+
   useEffect(() => {
-    const loadDetail = async () => {
+    if (!id) return
+
+    const run = async () => {
+      setLoading(true)
+      setError("")
+      setImageVariants([])
+      setMainImageIndex(0)
+      setSimilarItems([])
+      setSimilarLoading(true)
+
       try {
-        const jsonUrl = `${NODE_API}/json_extracted/${category}/${id}.json`
-        const res = await fetch(jsonUrl)
-        const json = await res.json()
-        setData(json)
+        // 1) 카드 JSON
+        const jsonUrl = `${API}/json_extracted/${encodeURIComponent(
+          realFolder
+        )}/${encodeURIComponent(id)}.json`
 
-        const imgRes = await fetch(`${NODE_API}/find_image/${id}`)
-        if (imgRes.ok) {
-          const { url } = await imgRes.json()
-          setImgUrl(`${NODE_API}${url}`)
+        const cardRes = await fetch(jsonUrl)
+        if (!cardRes.ok)
+          throw new Error(`카드 JSON 로드 실패: ${cardRes.status}`)
+
+        const cardJson = await cardRes.json()
+        if (!cardJson.id) cardJson.id = id
+        setCard(cardJson)
+
+        // 2) AI 큐레이션
+        const curateRes = await fetch(`${API}/curate`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id, card: cardJson }),
+        })
+        if (!curateRes.ok) {
+          const msg = await curateRes.text().catch(() => "")
+          throw new Error(msg || `큐레이션 생성 실패: ${curateRes.status}`)
         }
-      } catch (err) {
-        console.error("❌ 상세정보 로드 실패:", err)
+        const curateData = await curateRes.json()
+        setCuration(curateData.curator_text || "")
+
+        // 3) 이미지 로딩 (variants)
+        let candidateIds = []
+
+        if (variantsParam) {
+          // ArtworkGrid에서 넘겨준 id 리스트 우선 사용
+          candidateIds = variantsParam
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean)
+        } else {
+          // fallback: id 패턴으로 추측
+          const baseId = id.replace(/-\d+$/, "")
+          for (let i = 1; i <= 10; i++) {
+            candidateIds.push(`${baseId}-${i}`)
+          }
+        }
+
+        // 항상 현재 id는 포함되도록
+        if (!candidateIds.includes(id)) {
+          candidateIds.unshift(id)
+        }
+
+        // 중복 제거
+        candidateIds = Array.from(new Set(candidateIds))
+
+        const variantResults = await Promise.all(
+          candidateIds.map(async (cid) => {
+            try {
+              const res = await fetch(
+                `${API}/find_image/${encodeURIComponent(cid)}`
+              )
+              if (!res.ok) return null
+              const data = await res.json()
+              return { id: cid, url: `${API}${data.url}` }
+            } catch {
+              return null
+            }
+          })
+        )
+
+        const validVariants = variantResults.filter(Boolean)
+
+        if (validVariants.length > 0) {
+          setImageVariants(validVariants)
+          setImgUrl(validVariants[0].url)
+        } else {
+          // 그래도 아무 것도 못 찾으면 예전 방식으로 한 번 더 시도
+          const imgRes = await fetch(
+            `${API}/find_image/${encodeURIComponent(id)}`
+          )
+          if (imgRes.ok) {
+            const imgData = await imgRes.json()
+            const singleUrl = `${API}${imgData.url}`
+            setImgUrl(singleUrl)
+            setImageVariants([{ id, url: singleUrl }])
+          } else {
+            setImgUrl(null)
+            setImageVariants([])
+          }
+        }
+
+        // 4) 🔍 유사 작품 추천 호출
+        try {
+          const simRes = await fetch(
+            `${API}/similar_images?id=${encodeURIComponent(
+              id
+            )}&category=${category}&k=6`
+          )
+          if (simRes.ok) {
+            const simData = await simRes.json()
+            setSimilarItems(simData.items || [])
+          } else {
+            setSimilarItems([])
+          }
+        } catch (e) {
+          console.error("유사 작품 추천 오류:", e)
+          setSimilarItems([])
+        } finally {
+          setSimilarLoading(false)
+        }
+      } catch (e) {
+        console.error(e)
+        setError(
+          e.message ||
+            "작품 정보를 불러오는 중 문제가 발생했습니다. 다른 작품을 선택해 주세요."
+        )
+        setSimilarLoading(false)
+      } finally {
+        setLoading(false)
       }
     }
-    loadDetail()
-  }, [id, category])
 
-  // -------------------- AI 설명문 생성 --------------------
-  const handleCurateClick = async () => {
-    const next = !showCuration
-    setShowCuration(next)
+    run()
+  }, [id, realFolder, variantsParam, category])
 
-    // 이미 받아왔으면 재요청 없이 토글만
-    if (curation || !next || !data) return
-
-    setLoadingCuration(true)
-    try {
-      console.log("🧠 요청 →", `${FAST_API}/curate`)
-      const res = await fetch(`${FAST_API}/curate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id, card: data }),
-      })
-
-      if (!res.ok) {
-        const msg = await res.text().catch(() => "")
-        throw new Error(`서버 오류 (${res.status}) ${msg}`)
-      }
-
-      const json = await res.json()
-      setCuration(json.curator_text || "설명문 생성 실패")
-    } catch (err) {
-      console.error("❌ 설명문 생성 실패:", err)
-      setCuration("AI 설명문을 불러오는 중 오류가 발생했습니다.")
-    } finally {
-      setLoadingCuration(false)
-    }
-  }
-
-  // -------------------- 로딩 상태 --------------------
-  if (!data) {
+  if (loading) {
     return (
-      <div className="flex flex-col items-center justify-center h-screen text-gray-500">
-        📡 상세 정보를 불러오는 중...
+      <div
+        style={{
+          minHeight: "100vh",
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          fontFamily:
+            "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+        }}
+      >
+        <p style={{ fontSize: 18, marginBottom: 8 }}>
+          AI 큐레이터가 전시를 준비 중입니다...
+        </p>
+        <p style={{ fontSize: 14, color: "#6b7280" }}>잠시만 기다려 주세요.</p>
       </div>
     )
   }
 
-  // -------------------- 데이터 정리 --------------------
-  const desc = data.Description || {}
-  const obj = data.Object_Info || {}
-  const photo = data.Photo_Info || {}
-  const image = data.Image_Info || {}
-  const datainfo = data.Data_Info || {}
-
-  const titleKor = desc.ArtTitle_kor || data.title || "제목 없음"
-  const artistKor = desc.ArtistName_kor || "작가 미상"
-  const locationKor = desc.Location_kor || "-"
-  const materialKor = desc.Material_kor || "-"
-  const categoryKor = desc.Class_kor || obj.MiddleCategory || "-"
-
-  // -------------------- 화면 렌더링 --------------------
-  return (
-    <div className="min-h-screen bg-gray-50 flex flex-col items-center py-10">
-      <Link
-        to="/gallery"
-        className="mb-6 text-blue-500 hover:underline text-sm"
+  if (error) {
+    return (
+      <div
+        style={{
+          minHeight: "100vh",
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          padding: 24,
+          textAlign: "center",
+          fontFamily:
+            "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+        }}
       >
-        ← 갤러리로 돌아가기
-      </Link>
+        <p style={{ color: "#b91c1c", marginBottom: 12 }}>{error}</p>
+        <Link
+          to="/"
+          style={{
+            padding: "8px 16px",
+            borderRadius: 999,
+            border: "none",
+            backgroundColor: "#e2b48a",
+            color: "#332218",
+            fontWeight: 600,
+            textDecoration: "none",
+          }}
+        >
+          처음 화면으로 돌아가기
+        </Link>
+      </div>
+    )
+  }
 
-      <div className="bg-white rounded-2xl shadow-lg p-8 w-[900px]">
-        {/* 제목 */}
-        <h1 className="text-2xl font-bold text-center mb-4 text-blue-700">
-          {titleKor}
-        </h1>
+  // --------- 나머지 렌더링 부분 ---------
+  const title =
+    card?.Description?.ArtTitle_kor ||
+    card?.Description?.ArtTitle_eng ||
+    card?.Data_Info?.ImageFileName ||
+    id
 
-        {/* 작가 */}
-        <p className="text-center text-gray-600 mb-6">{artistKor}</p>
+  const artist =
+    card?.Description?.ArtistName_kor || card?.Description?.ArtistName_eng || ""
+  const klass =
+    card?.Description?.Class_kor || card?.Description?.Class_eng || ""
+  const year = card?.Photo_Info?.PhotoDate || ""
+  const material =
+    card?.Description?.Material_kor ||
+    card?.Description?.Material_eng ||
+    ""
 
-        {/* 대표 이미지 */}
-        {imgUrl && (
-          <img
-            src={imgUrl}
-            alt={titleKor}
-            className="w-full h-[450px] object-contain rounded-xl mb-6 shadow"
-          />
-        )}
+  const mainImage =
+    imageVariants.length > 0
+      ? imageVariants[Math.min(mainImageIndex, imageVariants.length - 1)]?.url
+      : imgUrl
 
-        {/* 주요 정보 */}
-        <div className="grid grid-cols-2 gap-6 mb-8">
-          <div className="bg-gray-100 rounded-xl p-4">
-            <h3 className="font-semibold text-blue-600 mb-2">📘 기본 정보</h3>
-            <p><strong>분류:</strong> {categoryKor}</p>
-            <p><strong>시대:</strong> {obj.MainCategory || "정보 없음"}</p>
-            <p><strong>소분류:</strong> {obj.SubCategory || "정보 없음"}</p>
-            <p><strong>재질:</strong> {materialKor}</p>
-            <p><strong>소재지:</strong> {locationKor}</p>
-          </div>
+  // score → (1 - score) * 100 으로 유사도 퍼센트 계산
+  const formatSimilarity = (score) => {
+    if (typeof score !== "number") return null
+    const sim = (1 - score) * 100
+    if (!Number.isFinite(sim)) return null
+    return `${sim.toFixed(1)}%`
+  }
 
-          <div className="bg-gray-100 rounded-xl p-4">
-            <h3 className="font-semibold text-blue-600 mb-2">📷 촬영 정보</h3>
-            <p><strong>촬영일자:</strong> {photo.PhotoDate || "정보 없음"}</p>
-            <p><strong>촬영장비:</strong> {photo.PhotoEquipment || "정보 없음"}</p>
-            <p><strong>이미지 크기:</strong> 
-              {image.Width ? `${image.Width} x ${image.Length} x ${image.Height || "-"}` : "정보 없음"}
-            </p>
-            <p><strong>파일명:</strong> {datainfo.ImageFileName || id}</p>
-            <p><strong>형식:</strong> {datainfo.SourceDataExtension || "jpg"}</p>
-            <p><strong>이용범위:</strong> {datainfo.Rangeofuse || "-"}</p>
-          </div>
-        </div>
-
-        {/* 작품 설명(원본 메타에서 추출) */}
-        <div className="bg-gray-50 rounded-xl p-6 border border-gray-200">
-          <h3 className="font-semibold text-blue-600 mb-2">🖋️ 작품 설명</h3>
-          <p className="text-gray-700 leading-relaxed">
-            {desc.ArtTitle_kor && desc.ArtTitle_eng ? (
-              <>
-                <strong>{desc.ArtTitle_kor}</strong>
-                <br />
-                <span className="text-gray-500 italic">{desc.ArtTitle_eng}</span>
-              </>
-            ) : (
-              "작품 설명 없음"
-            )}
-          </p>
-        </div>
-
-        {/* 🧠 AI 설명문 (버튼 + 아코디언) */}
-        <div className="mt-6">
-          <button
-            onClick={handleCurateClick}
-            className="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 px-4 rounded-xl shadow transition"
+  return (
+    <div
+      style={{
+        minHeight: "100vh",
+        background:
+          "linear-gradient(to bottom, #fdfaf5 0%, #f5eee3 40%, #f5f3ee 100%)",
+        padding: "32px 16px 40px",
+        boxSizing: "border-box",
+      }}
+    >
+      <div style={{ maxWidth: 1100, margin: "0 auto" }}>
+        {/* 상단 네비 */}
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            marginBottom: 24,
+            gap: 12,
+          }}
+        >
+          <Link
+            to="/"
+            style={{
+              padding: "6px 12px",
+              borderRadius: 999,
+              border: "1px solid rgba(0,0,0,0.06)",
+              backgroundColor: "rgba(255,255,255,0.9)",
+              fontSize: 13,
+              textDecoration: "none",
+              color: "#4b5563",
+            }}
           >
-            {showCuration ? "🧠 AI 설명문 접기" : "🧠 AI 설명문 생성"}
-          </button>
+            ← 다른 전시 찾아보기
+          </Link>
+          <span style={{ fontSize: 13, color: "#9ca3af" }}>
+            텍스트 해설 모드
+          </span>
+        </div>
 
-          {showCuration && (
-            <div className="mt-4 bg-gray-100 rounded-xl p-4 text-sm text-gray-700 border border-gray-200">
-              {loadingCuration ? (
-                <p className="text-blue-500 animate-pulse">⌛ 설명문 생성 중입니다...</p>
+        {/* 중앙 카드 */}
+        <div
+          style={{
+            maxWidth: 900,
+            margin: "0 auto",
+            borderRadius: 28,
+            backgroundColor: "rgba(255,255,255,0.96)",
+            boxShadow: "0 18px 45px rgba(15, 23, 42, 0.22)",
+            border: "1px solid rgba(0,0,0,0.04)",
+            padding: "24px 26px 26px",
+          }}
+        >
+          {/* 이미지 + 썸네일 영역 */}
+          <div
+            style={{
+              width: "100%",
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              marginBottom: 20,
+            }}
+          >
+            <div
+              style={{
+                width: "100%",
+                maxWidth: 650,
+                aspectRatio: "4 / 3",
+                backgroundColor: "#ede9e4",
+                borderRadius: 22,
+                boxShadow: "0 14px 40px rgba(15,23,42,0.18)",
+                overflow: "hidden",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                padding: 16,
+              }}
+            >
+              {mainImage ? (
+                <img
+                  src={mainImage}
+                  alt={title}
+                  style={{
+                    maxWidth: "100%",
+                    maxHeight: "60vh",
+                    objectFit: "contain",
+                  }}
+                />
               ) : (
-                <p className="whitespace-pre-wrap leading-relaxed">
-                  {curation || "아직 생성된 설명문이 없습니다."}
-                </p>
+                <span style={{ color: "#6b7280", fontSize: 13 }}>
+                  이미지를 불러올 수 없습니다.
+                </span>
               )}
             </div>
-          )}
+
+            {/* 여러 이미지가 있을 때 썸네일 리스트 */}
+            {imageVariants.length > 1 && (
+              <div
+                style={{
+                  marginTop: 12,
+                  display: "flex",
+                  flexWrap: "wrap",
+                  gap: 8,
+                  justifyContent: "center",
+                }}
+              >
+                {imageVariants.map((v, idx) => (
+                  <img
+                    key={v.id}
+                    src={v.url}
+                    alt={`${title} - view ${idx + 1}`}
+                    onClick={() => setMainImageIndex(idx)}
+                    style={{
+                      width: 64,
+                      height: 64,
+                      objectFit: "cover",
+                      borderRadius: 10,
+                      cursor: "pointer",
+                      border:
+                        idx === mainImageIndex
+                          ? "2px solid #e2b48a"
+                          : "1px solid rgba(0,0,0,0.08)",
+                      opacity: idx === mainImageIndex ? 1 : 0.8,
+                      boxShadow:
+                        idx === mainImageIndex
+                          ? "0 4px 10px rgba(0,0,0,0.18)"
+                          : "none",
+                    }}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* 텍스트 영역 */}
+          <div>
+            <h1
+              style={{
+                margin: 0,
+                marginBottom: 8,
+                fontSize: "clamp(22px, 3vw, 28px)",
+                fontWeight: 500,
+                color: "#1f2933",
+                fontFamily:
+                  "'Nanum Myeongjo', 'Apple SD Gothic Neo', 'Malgun Gothic', serif",
+              }}
+            >
+              {title}
+            </h1>
+
+            <div style={{ marginBottom: 14, fontSize: 14, color: "#4b5563" }}>
+              {artist && <span>{artist}</span>}
+              {klass && (
+                <>
+                  {artist && " · "}
+                  <span>{klass}</span>
+                </>
+              )}
+              {(year || material) && (
+                <div style={{ marginTop: 4, fontSize: 13, color: "#6b7280" }}>
+                  {year && <span>{year}</span>}
+                  {year && material && " · "}
+                  {material && <span>{material}</span>}
+                </div>
+              )}
+            </div>
+
+            {/* 설명문 */}
+            <div
+              style={{
+                padding: "14px 16px",
+                borderRadius: 18,
+                backgroundColor: "#f9fafb",
+                fontSize: 15,
+                lineHeight: 1.7,
+                color: "#374151",
+                whiteSpace: "pre-wrap",
+              }}
+            >
+              {curation || "이 작품에 대한 설명을 불러오지 못했습니다."}
+            </div>
+          </div>
+
+          {/* ⭐ 유사 작품 추천 섹션 */}
+          <div style={{ marginTop: 36 }}>
+            <h2
+              style={{
+                fontSize: 20,
+                fontWeight: 600,
+                color: "#1f2937",
+                marginBottom: 16,
+                fontFamily: "'Nanum Myeongjo', serif",
+              }}
+            >
+              비슷한 작품 추천
+            </h2>
+
+            {similarLoading ? (
+              <p style={{ color: "#6b7280", fontSize: 14 }}>
+                유사 작품을 불러오는 중...
+              </p>
+            ) : similarItems.length === 0 ? (
+              <p style={{ color: "#9ca3af", fontSize: 14 }}>
+                유사한 작품을 찾지 못했습니다.
+              </p>
+            ) : (
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(auto-fill, minmax(130px, 1fr))",
+                  gap: 16,
+                  marginTop: 4,
+                }}
+              >
+                {similarItems.map((item, idx) => {
+                  const simText = formatSimilarity(item.score)
+                  return (
+                    <Link
+                      key={item.id}
+                      to={`/detail/${item.id}?category=${item.category || category}`}
+                      style={{
+                        textDecoration: "none",
+                        color: "inherit",
+                      }}
+                    >
+                      <div
+                        style={{
+                          position: "relative",
+                          borderRadius: 12,
+                          backgroundColor: "white",
+                          boxShadow: "0 4px 10px rgba(0,0,0,0.08)",
+                          padding: 10,
+                          cursor: "pointer",
+                          transition: "transform 0.15s, box-shadow 0.15s",
+                        }}
+                        onMouseEnter={(e) => {
+                          e.currentTarget.style.transform = "translateY(-2px)"
+                          e.currentTarget.style.boxShadow =
+                            "0 8px 20px rgba(0,0,0,0.18)"
+                        }}
+                        onMouseLeave={(e) => {
+                          e.currentTarget.style.transform = "translateY(0)"
+                          e.currentTarget.style.boxShadow =
+                            "0 4px 10px rgba(0,0,0,0.08)"
+                        }}
+                      >
+                        {/* 순번 뱃지 */}
+                        <div
+                          style={{
+                            position: "absolute",
+                            top: 8,
+                            left: 8,
+                            padding: "2px 7px",
+                            borderRadius: 999,
+                            backgroundColor: "rgba(0,0,0,0.55)",
+                            color: "white",
+                            fontSize: 11,
+                          }}
+                        >
+                          #{idx + 1}
+                        </div>
+
+                        <img
+                          src={`${API}${item.image_path}`}
+                          alt={item.title}
+                          style={{
+                            width: "100%",
+                            height: 110,
+                            objectFit: "cover",
+                            borderRadius: 8,
+                            marginBottom: 8,
+                          }}
+                        />
+                        <div
+                          style={{
+                            fontSize: 13,
+                            fontWeight: 500,
+                            color: "#374151",
+                            marginBottom: 2,
+                            whiteSpace: "nowrap",
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                          }}
+                        >
+                          {item.title || "제목 없음"}
+                        </div>
+                        <div
+                          style={{
+                            fontSize: 12,
+                            color: "#6b7280",
+                            whiteSpace: "nowrap",
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            marginBottom: 2,
+                          }}
+                        >
+                          {item.artist}
+                        </div>
+                        {simText && (
+                          <div
+                            style={{
+                              fontSize: 11,
+                              color: "#2563eb",
+                              marginTop: 2,
+                            }}
+                          >
+                            유사도 {simText}
+                          </div>
+                        )}
+                      </div>
+                    </Link>
+                  )
+                })}
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </div>
