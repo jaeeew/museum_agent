@@ -332,6 +332,74 @@ def retrieve_image_context(query: str, k: int = 5) -> List[Dict]:
         )
     return hits
 
+# ───────────────────────────────────────────────────────────
+# 유사한 작품 추천
+# ───────────────────────────────────────────────────────────
+
+def similar_images_by_id(
+    base_id: str,
+    k: int = 5,
+    category: Optional[str] = None,
+) -> List[Dict]:
+    """
+    curator_image_clip 컬렉션 안에서
+    - base_id 작품과 CLIP 기준으로 비슷한 작품 k개 찾기
+    - category가 주어지면 같은 category만 필터링 (painting_json / craft_json / sculpture_json 등)
+    """
+    if not use_image_retriever or not image_collection:
+        raise HTTPException(status_code=500, detail="image retriever disabled")
+
+    # 1) 기준 작품의 embedding 꺼내기
+    doc = image_collection.get(
+        ids=[base_id],
+        include=["embeddings", "metadatas"],
+    )
+    if not doc or not doc.get("embeddings"):
+        raise HTTPException(status_code=404, detail=f"no embedding for id={base_id}")
+
+    base_emb = doc["embeddings"][0]  # List[float]
+    base_meta = (doc.get("metadatas") or [{}])[0]
+
+    # 2) 이 embedding으로 근접 이웃 검색
+    res = image_collection.query(
+        query_embeddings=[base_emb],
+        n_results=k + 5,  # 자기 자신 + 다른 카테고리 제외 고려해서 여유 있게
+    )
+
+    ids = res.get("ids", [[]])[0]
+    metas = res.get("metadatas", [[]])[0]
+    dists = res.get("distances", [[]])[0] if "distances" in res else [None] * len(ids)
+
+    items: List[Dict] = []
+    for i, cid in enumerate(ids):
+        if cid == base_id:
+            continue  # 자기 자신 제외
+
+        meta = metas[i] if i < len(metas) else {}
+        score = dists[i] if i < len(dists) else None
+
+        # category 필터 (painting_json / craft_json / sculpture_json 등)
+        if category and meta.get("category") and meta.get("category") != category:
+            continue
+
+        items.append(
+            {
+                "id": cid,
+                "title": meta.get("title", ""),
+                "artist": meta.get("artist", ""),
+                "class": meta.get("class", ""),
+                "year": meta.get("year", ""),
+                "category": meta.get("category"),         # ex) "painting_json"
+                "image_path": meta.get("image_path"),     # 프론트에서 img src로 쓰기
+                "score": score,
+            }
+        )
+
+        if len(items) >= k:
+            break
+
+    return items
+
 
 # ───────────────────────────────────────────────────────────
 # 프롬프트 빌더
@@ -550,6 +618,31 @@ def search_image(q: str, k: int = 5):
         ]
     }
 
+@app.get("/similar_images")
+def similar_images(
+    id: str,
+    k: int = 5,
+    category: Optional[str] = None,
+):
+    """
+    특정 작품 id 기준으로 CLIP 유사도 Top-k 추천.
+    - id: 기준 작품 id (curator_image_clip에 이미 인덱싱되어 있어야 함)
+    - category: 같은 카테고리만 보고 싶으면 "painting_json" / "craft_json" / "sculpture_json" 등 넣기
+                None이면 카테고리 상관없이 전부에서 검색
+    """
+    try:
+        items = similar_images_by_id(base_id=id, k=k, category=category)
+    except HTTPException:
+        # FastAPI가 알아서 처리함
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"similar_images failed: {e}")
+
+    return {
+        "base_id": id,
+        "category": category,
+        "items": items,
+    }
 
 @app.post("/ai/agent")
 async def agent_route(req: AgentIn):
