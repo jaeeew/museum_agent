@@ -22,29 +22,50 @@ export default function Immersive() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState("")
 
-  // ---------- TTS 관련 상태 ----------
-  const [ttsReady, setTtsReady] = useState(false)
-  const [tourRunning, setTourRunning] = useState(false)
-  const [tourStep, setTourStep] = useState(0)
+  
+  // ---------- TTS / 오디오 상태 ----------
+  const [segments, setSegments] = useState([])            // [{ text, step }]
+  const [activeIndex, setActiveIndex] = useState(-1)      // 현재 읽는 문장 인덱스
+  const [segmentTimings, setSegmentTimings] = useState([]) // [{start, end}]
 
-  const voiceRef = useRef(null)
-  const utteranceRef = useRef(null)
+  const [audioUrl, setAudioUrl] = useState(null)
+  const audioRef = useRef(null)
 
-  // 화면 이동용 ref
+  const [audioLoading, setAudioLoading] = useState(false) // TTS 생성 중
+  const [audioReady, setAudioReady] = useState(false)     // 오디오 준비 완료
+  const [isPlaying, setIsPlaying] = useState(false)
+  const [speechRate, setSpeechRate] = useState(1.0)
+
+  // 음성 타입 (여성/남성) + 실제 Google TTS voice_name
+  const [voiceType, setVoiceType] = useState("female") // "female" | "male"
+  const [voiceName, setVoiceName] = useState("ko-KR-Wavenet-A")
+
+  // 화면 이동용
+  const [tourStep, setTourStep] = useState(0) // 0~4 단계 (이미지 패닝용)
   const imageContainerRef = useRef(null)
 
-  // 카테고리 → 폴더 매핑 (Detail.jsx와 동일하게 맞춰 줌)
+  // 카테고리 → 폴더 매핑
   const CATEGORY_MAP = {
-    painting_json: "TL_01. 2D_02.회화(Json)",
-    craft_json: "TL_01. 2D_04.공예(Json)",
-    sculpture_json: "TL_01. 2D_06.조각(Json)",
+    painting_json: "painting_json",
+    craft_json: "craft_json",
+    sculpture_json: "sculpture_json",
   }
-
   const realFolder = CATEGORY_MAP[category] || category
 
-  // ==============================
+  // ----------------------------------------
+  // 0. 음성 타입 → voiceName 매핑
+  // ----------------------------------------
+  useEffect(() => {
+    if (voiceType === "female") {
+      setVoiceName("ko-KR-Wavenet-A")
+    } else {
+      setVoiceName("ko-KR-Wavenet-B")
+    }
+  }, [voiceType])
+
+  // ----------------------------------------
   // 1. 작품 / 이미지 / 해설문 불러오기
-  // ==============================
+  // ----------------------------------------
   useEffect(() => {
     if (!id) return
 
@@ -68,7 +89,7 @@ export default function Immersive() {
         if (cancelled) return
         setCard(cardJson)
 
-        // 2) AI 큐레이션 (Detail에서 쓰는 것과 동일한 /curate 엔드포인트)
+        // 2) AI 큐레이션
         const curateRes = await fetch(`${API}/curate`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -112,75 +133,38 @@ export default function Immersive() {
     }
   }, [id, realFolder])
 
-  // ==============================
-  // 2. 브라우저 TTS 초기화
-  // ==============================
+  // ----------------------------------------
+  // 2. 큐레이션 텍스트 → 문장 세그먼트 분리
+  // ----------------------------------------
   useEffect(() => {
-    if (typeof window === "undefined") return
-    if (!("speechSynthesis" in window)) {
-      setTtsReady(false)
+    if (!curation) {
+      setSegments([])
+      setActiveIndex(-1)
       return
     }
 
-    const initVoices = () => {
-      const voices = window.speechSynthesis.getVoices()
-      if (!voices || voices.length === 0) return
-
-      const korVoice =
-        voices.find((v) => v.lang.startsWith("ko")) ||
-        voices.find((v) => v.lang.startsWith("en")) ||
-        voices[0]
-
-      voiceRef.current = korVoice
-      setTtsReady(true)
-    }
-
-    initVoices()
-    window.speechSynthesis.onvoiceschanged = initVoices
-
-    return () => {
-      window.speechSynthesis.onvoiceschanged = null
-    }
-  }, [])
-
-  const stopTTS = () => {
-    if (!("speechSynthesis" in window)) return
-    window.speechSynthesis.cancel()
-    utteranceRef.current = null
-  }
-
-  useEffect(() => {
-    return () => {
-      stopTTS()
-    }
-  }, [])
-
-  // ==============================
-  // 3. 문장 → 화면 포인트 매핑 로직
-  //    (여기서 "왼쪽/오른쪽/중앙/글씨/꽃" 같은 단어를 보고
-  //     자동으로 어디를 확대할지 결정함)
-  // ==============================
-  const segments = useMemo(() => {
-    if (!curation) return []
-
-    // 기본 문장 분리
     const rawSentences = curation
-      .split(/(?<=[\.!?])\s+|\n+/) // 마침표 + 공백, 줄바꿈 기준
+      .split(/(?<=[\.!?])\s+|\n+/) // 마침표/느낌표/줄바꿈 기준
       .map((s) => s.trim())
       .filter(Boolean)
 
     const mapped = rawSentences.map((text, idx) => {
-      const t = text.toLowerCase()
-
-      // 한글 키워드는 소문자 처리 필요 X 이지만 그냥 같이 사용
       const hasLeft =
         text.includes("왼쪽") || text.includes("좌측") || text.includes("왼편")
       const hasRight =
-        text.includes("오른쪽") || text.includes("우측") || text.includes("오른편")
+        text.includes("오른쪽") ||
+        text.includes("우측") ||
+        text.includes("오른편")
       const hasCenter =
-        text.includes("가운데") || text.includes("중앙") || text.includes("한가운데")
-      const hasTop = text.includes("위쪽") || text.includes("윗부분") || text.includes("상단")
-      const hasBottom = text.includes("아래") || text.includes("하단") || text.includes("아랫부분")
+        text.includes("가운데") ||
+        text.includes("중앙") ||
+        text.includes("한가운데")
+      const hasTop =
+        text.includes("위쪽") || text.includes("윗부분") || text.includes("상단")
+      const hasBottom =
+        text.includes("아래") ||
+        text.includes("하단") ||
+        text.includes("아랫부분")
 
       const mentionsFlower =
         text.includes("꽃") ||
@@ -197,10 +181,8 @@ export default function Immersive() {
         text.includes("서예") ||
         text.includes("글자")
 
-      // 0: 전체, 1: 왼쪽/아래, 2: 중앙, 3: 오른쪽/위, 4: 전체 약간 줌
       let step = 0
 
-      // 첫 문장은 작품 전체 소개용
       if (idx === 0) {
         step = 0
       } else if (hasLeft && hasBottom) {
@@ -218,25 +200,170 @@ export default function Immersive() {
       } else if (hasBottom) {
         step = 1
       } else if (mentionsText) {
-        // 서예/글씨는 보통 오른쪽 or 중앙
         step = 3
       } else if (mentionsFlower || mentionsBranch) {
-        // 꽃/나뭇가지는 화면 왼쪽/아래에 있는 경우가 많아서 1번에 매핑
         step = 1
       } else {
-        // 특별한 키워드가 없으면 살짝 줌인 정도
         step = 4
       }
 
       return { text, step }
     })
 
-    return mapped
+    setSegments(mapped)
+    setActiveIndex(-1)
+    setSegmentTimings([])
   }, [curation])
 
-  // ==============================
-  // 4. 화면 포커싱 스타일
-  // ==============================
+  // ----------------------------------------
+  // 3. 큐레이션 + voiceName → Google TTS 호출
+  // ----------------------------------------
+  useEffect(() => {
+    if (!curation) return
+
+    let cancelled = false
+
+    const run = async () => {
+      try {
+        setAudioLoading(true)
+        setAudioReady(false)
+        setIsPlaying(false)
+        setAudioUrl(null)
+        setActiveIndex(-1)
+        setSegmentTimings([])
+
+        const res = await fetch(`${API}/ai/tts`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text: curation,
+            language_code: "ko-KR",
+            voice_name: voiceName, // 여성/남성 선택 반영
+            speaking_rate: 1.0, // 실제 재생 속도는 브라우저 playbackRate로 제어
+          }),
+        })
+
+        if (!res.ok) {
+          const msg = await res.text().catch(() => "")
+          throw new Error(msg || `TTS 생성 실패: ${res.status}`)
+        }
+
+        const json = await res.json()
+        if (cancelled) return
+
+        const url = `data:audio/mp3;base64,${json.audio_b64}`
+        setAudioUrl(url)
+        setAudioReady(true)
+      } catch (e) {
+        console.error(e)
+        if (!cancelled) {
+          setAudioUrl(null)
+          setAudioReady(false)
+        }
+      } finally {
+        if (!cancelled) setAudioLoading(false)
+      }
+    }
+
+    run()
+
+    return () => {
+      cancelled = true
+    }
+  }, [curation, voiceName])
+
+  // ----------------------------------------
+  // 4. 오디오 메타데이터 로드되면 → 문장별 시간 구간 대략 매핑
+  // ----------------------------------------
+  const handleLoadedMetadata = () => {
+    const el = audioRef.current
+    if (!el || !segments.length) return
+
+    const duration = el.duration
+    if (!isFinite(duration) || duration <= 0) return
+
+    const lengths = segments.map((s) => s.text.length || 1)
+    const total = lengths.reduce((a, b) => a + b, 0)
+    if (total <= 0) return
+
+    let cum = 0
+    const timings = segments.map((s, idx) => {
+      const start = (cum / total) * duration
+      cum += lengths[idx]
+      const end = (cum / total) * duration
+      return { start, end }
+    })
+
+    setSegmentTimings(timings)
+  }
+
+  // 오디오 진행 상황에 따라 activeIndex 업데이트
+  const handleTimeUpdate = () => {
+    const el = audioRef.current
+    if (!el || !segmentTimings.length) return
+
+    const t = el.currentTime
+    const idx = segmentTimings.findIndex(
+      (seg) => t >= seg.start && t < seg.end
+    )
+
+    if (idx !== -1 && idx !== activeIndex) {
+      setActiveIndex(idx)
+    }
+  }
+
+  const handleEnded = () => {
+    setIsPlaying(false)
+    setActiveIndex(-1)
+  }
+
+  // activeIndex → tourStep (이미지 패닝)
+  useEffect(() => {
+    if (activeIndex < 0 || !segments.length) {
+      setTourStep(0)
+      return
+    }
+    setTourStep(segments[activeIndex].step)
+  }, [activeIndex, segments])
+
+  // ----------------------------------------
+  // 5. 재생 컨트롤 (Play / Pause / Stop / Rate)
+  // ----------------------------------------
+  const handlePlay = async () => {
+    if (!audioRef.current || !audioUrl) return
+    try {
+      audioRef.current.playbackRate = speechRate
+      await audioRef.current.play()
+      setIsPlaying(true)
+    } catch (e) {
+      console.error(e)
+    }
+  }
+
+  const handlePause = () => {
+    if (!audioRef.current) return
+    audioRef.current.pause()
+    setIsPlaying(false)
+  }
+
+  const handleStop = () => {
+    if (!audioRef.current) return
+    audioRef.current.pause()
+    audioRef.current.currentTime = 0
+    setIsPlaying(false)
+    setActiveIndex(-1)
+  }
+
+  const handleChangeRate = (rate) => {
+    setSpeechRate(rate)
+    if (audioRef.current) {
+      audioRef.current.playbackRate = rate
+    }
+  }
+
+  // ----------------------------------------
+  // 6. 이미지 패닝 스타일
+  // ----------------------------------------
   const getPanStyle = () => {
     switch (tourStep) {
       case 1:
@@ -267,56 +394,9 @@ export default function Immersive() {
     }
   }
 
-  // ==============================
-  // 5. 몰입형 투어 시작 (문장 단위 TTS + 화면 이동)
-  // ==============================
-  const startImmersiveTour = () => {
-    if (!ttsReady || !segments.length) return
-
-    stopTTS()
-    setTourRunning(true)
-
-    let index = 0
-
-    const playSegment = () => {
-      if (index >= segments.length) {
-        setTourRunning(false)
-        setTourStep(0)
-        return
-      }
-
-      const { text, step } = segments[index]
-
-      // 화면 포인트 먼저 바꾸고
-      setTourStep(step)
-
-      // 그다음 해당 문장을 읽어 줌
-      const utter = new SpeechSynthesisUtterance(text)
-      if (voiceRef.current) utter.voice = voiceRef.current
-      utter.rate = 1.0
-      utter.pitch = 1.0
-
-      utter.onend = () => {
-        index += 1
-        playSegment()
-      }
-
-      utteranceRef.current = utter
-      window.speechSynthesis.speak(utter)
-    }
-
-    playSegment()
-  }
-
-  const stopImmersiveTour = () => {
-    stopTTS()
-    setTourRunning(false)
-    setTourStep(0)
-  }
-
-  // ==============================
-  // 6. 화면 렌더링
-  // ==============================
+  // ----------------------------------------
+  // 7. 화면 렌더링
+  // ----------------------------------------
   if (loading) {
     return (
       <PageLayout>
@@ -388,12 +468,29 @@ export default function Immersive() {
   const material =
     card?.Description?.Material_kor || card?.Description?.Material_eng || ""
 
-  const tourStatusText = tourRunning
-    ? "현재 단계: 투어 진행 중"
-    : "현재 단계: 투어 종료"
+  let tourStatusText = ""
+  if (audioLoading) {
+    tourStatusText = "TTS 음성을 준비하는 중입니다..."
+  } else if (isPlaying) {
+    tourStatusText = "현재 단계: 투어 진행 중"
+  } else if (audioReady) {
+    tourStatusText = "현재 단계: 일시정지됨"
+  } else {
+    tourStatusText = "현재 단계: 준비되지 않았습니다"
+  }
 
   return (
     <PageLayout>
+      {/* 숨겨진 오디오 요소 */}
+      <audio
+        ref={audioRef}
+        src={audioUrl || undefined}
+        onLoadedMetadata={handleLoadedMetadata}
+        onTimeUpdate={handleTimeUpdate}
+        onEnded={handleEnded}
+        style={{ display: "none" }}
+      />
+
       <div
         style={{
           display: "flex",
@@ -550,25 +647,31 @@ export default function Immersive() {
             <div
               style={{
                 display: "flex",
-                gap: 10,
+                gap: 8,
                 flexWrap: "wrap",
                 marginBottom: 10,
               }}
             >
               <button
-                onClick={startImmersiveTour}
-                disabled={!ttsReady || !segments.length}
+                onClick={handlePlay}
+                disabled={!audioReady || audioLoading || !segments.length}
                 style={{
                   padding: "8px 14px",
                   borderRadius: 999,
                   border: "none",
                   backgroundColor:
-                    !ttsReady || !segments.length ? "#e5e7eb" : "#f97316",
+                    !audioReady || audioLoading || !segments.length
+                      ? "#e5e7eb"
+                      : "#f97316",
                   color:
-                    !ttsReady || !segments.length ? "#9ca3af" : "#fefaf4",
+                    !audioReady || audioLoading || !segments.length
+                      ? "#9ca3af"
+                      : "#fefaf4",
                   fontSize: 13,
                   cursor:
-                    !ttsReady || !segments.length ? "not-allowed" : "pointer",
+                    !audioReady || audioLoading || !segments.length
+                      ? "not-allowed"
+                      : "pointer",
                   display: "flex",
                   alignItems: "center",
                   gap: 6,
@@ -578,7 +681,8 @@ export default function Immersive() {
               </button>
 
               <button
-                onClick={stopImmersiveTour}
+                onClick={handlePause}
+                disabled={!isPlaying}
                 style={{
                   padding: "8px 14px",
                   borderRadius: 999,
@@ -586,29 +690,151 @@ export default function Immersive() {
                   backgroundColor: "#f3f4f6",
                   color: "#374151",
                   fontSize: 13,
-                  cursor: "pointer",
+                  cursor: !isPlaying ? "not-allowed" : "pointer",
+                  opacity: !isPlaying ? 0.6 : 1,
                 }}
               >
-                ⏹ 투어 / 음성 정지
+                ⏸ 투어 일시정지
+              </button>
+
+              <button
+                onClick={handleStop}
+                disabled={!audioReady}
+                style={{
+                  padding: "8px 14px",
+                  borderRadius: 999,
+                  border: "none",
+                  backgroundColor: "#f3f4f6",
+                  color: "#374151",
+                  fontSize: 13,
+                  cursor: !audioReady ? "not-allowed" : "pointer",
+                  opacity: !audioReady ? 0.6 : 1,
+                }}
+              >
+                ⏹ 투어 정지
               </button>
             </div>
 
-            {!ttsReady && (
+            {/* 음성 타입 + 배속 컨트롤 */}
+            <div
+              style={{
+                marginTop: 6,
+                display: "flex",
+                flexDirection: "column",
+                gap: 8,
+              }}
+            >
+              {/* 음성 타입 선택 */}
               <div
                 style={{
-                  fontSize: 12,
-                  color: "#b91c1c",
-                  marginTop: 4,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  flexWrap: "wrap",
                 }}
               >
-                이 브라우저에서는 음성 합성이 지원되지 않을 수 있습니다. 다른
-                브라우저에서 다시 시도해 주세요.
+                <span
+                  style={{
+                    fontSize: 12,
+                    color: "#9ca3af",
+                    marginRight: 4,
+                  }}
+                >
+                  음성 타입
+                </span>
+                <button
+                  onClick={() => setVoiceType("female")}
+                  disabled={audioLoading}
+                  style={{
+                    padding: "4px 10px",
+                    borderRadius: 999,
+                    border:
+                      voiceType === "female"
+                        ? "1px solid #fb923c"
+                        : "1px solid #e5e7eb",
+                    backgroundColor:
+                      voiceType === "female" ? "#fff7ed" : "#ffffff",
+                    fontSize: 12,
+                    cursor: audioLoading ? "not-allowed" : "pointer",
+                    color: "#374151",
+                  }}
+                >
+                  여성 음성
+                </button>
+                <button
+                  onClick={() => setVoiceType("male")}
+                  disabled={audioLoading}
+                  style={{
+                    padding: "4px 10px",
+                    borderRadius: 999,
+                    border:
+                      voiceType === "male"
+                        ? "1px solid #fb923c"
+                        : "1px solid #e5e7eb",
+                    backgroundColor:
+                      voiceType === "male" ? "#fff7ed" : "#ffffff",
+                    fontSize: 12,
+                    cursor: audioLoading ? "not-allowed" : "pointer",
+                    color: "#374151",
+                  }}
+                >
+                  남성 음성
+                </button>
+                <span
+                  style={{
+                    fontSize: 11,
+                    color: "#9ca3af",
+                  }}
+                >
+                  (Google Wavenet 음성)
+                </span>
               </div>
-            )}
+
+              {/* 재생 속도 */}
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  flexWrap: "wrap",
+                }}
+              >
+                <span
+                  style={{
+                    fontSize: 12,
+                    color: "#9ca3af",
+                    marginRight: 4,
+                  }}
+                >
+                  재생 속도
+                </span>
+                {[1.0, 1.2, 1.5, 2.0].map((rate) => (
+                  <button
+                    key={rate}
+                    onClick={() => handleChangeRate(rate)}
+                    style={{
+                      padding: "4px 10px",
+                      borderRadius: 999,
+                      border:
+                        speechRate === rate
+                          ? "1px solid #fb923c"
+                          : "1px solid #e5e7eb",
+                      backgroundColor:
+                        speechRate === rate ? "#fff7ed" : "#ffffff",
+                      fontSize: 12,
+                      cursor: "pointer",
+                      color: "#374151",
+                    }}
+                  >
+                    {rate.toFixed(1)}배
+                  </button>
+                ))}
+              </div>
+            </div>
           </div>
         </div>
 
-        {/* 하단: 텍스트 해설 전문 */}
+        {/* 하단: 텍스트 해설 전문 (현재 문장 하이라이트) */}
         <div
           style={{
             marginTop: 10,
@@ -635,7 +861,21 @@ export default function Immersive() {
               whiteSpace: "pre-wrap",
             }}
           >
-            {curation || "이 작품에 대한 설명을 불러오지 못했습니다."}
+            {segments.length ? (
+              segments.map((seg, idx) => (
+                <span
+                  key={idx}
+                  style={{
+                    fontWeight: idx === activeIndex ? 700 : 400,
+                    color: idx === activeIndex ? "#1d4ed8" : "#374151",
+                  }}
+                >
+                  {seg.text + " "}
+                </span>
+              ))
+            ) : (
+              curation || "이 작품에 대한 설명을 불러오지 못했습니다."
+            )}
           </div>
         </div>
       </div>
