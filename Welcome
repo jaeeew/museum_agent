@@ -1,0 +1,341 @@
+// C:/Exhibit/curator_server/frontend/src/components/Welcome.jsx
+
+import React, { useState } from "react"
+import { useNavigate } from "react-router-dom"
+
+const API = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000"
+
+export default function Welcome() {
+  const navigate = useNavigate()
+  const [intent, setIntent] = useState("")
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState("")
+
+  // ⭐ 예시 질문 목록 (각각 다른 에이전트 액션을 유도하는 프롬프트)
+  const examplePrompts = [
+    {
+      label: "🎨 회화 한 점을 차분히 설명해줘",
+      prompt:
+        "한국 근대 회화 한 점을 골라서, 관람객에게 말하듯 차분하게 설명해줘. 작품 제목과 작가, 제작 시기, 화면 구성을 중심으로 6~8문장으로 말해줘.",
+    },
+    {
+      label: "🇰🇷 한국 작품 두 개를 비교해줘",
+      prompt:
+        "한국 회화 작품 두 점을 골라 서로 비교해줘. 공통된 주제와 다른 표현 방식, 색채와 구도 차이를 관람객에게 설명하듯 이야기해줘.",
+    },
+    {
+      label: "🧭 작품 하나로 몰입형 투어를 해줘",
+      prompt:
+        "작품 하나를 선택해서, 시선이 어디서 어디로 이동하면 좋을지 안내하는 몰입형 투어 해설을 만들어줘. 왼쪽, 오른쪽, 중앙, 위쪽, 아래쪽 같은 위치 표현을 꼭 넣어줘.",
+    },
+  ]
+
+  // ✅ 그냥 갤러리로 보내는 버튼 (AI 안 쓰고 바로 목록 보기)
+  const handleOpenGallery = () => {
+    navigate("/gallery?category=painting_json")
+  }
+
+  // 🔧 공통 에이전트 호출 함수 (입력값 or 프리셋 텍스트 사용)
+  const handleStart = async (overrideText) => {
+    const base = overrideText ?? intent
+    const q = base.trim() || "오늘 볼 만한 작품을 추천해줘"
+    if (loading) return
+
+    setLoading(true)
+    setError("")
+
+    try {
+      const res = await fetch(`${API}/ai/agent`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          query: q,
+        }),
+      })
+
+      if (!res.ok) {
+        const msg = await res.text().catch(() => "")
+        throw new Error(msg || `Agent 호출 실패 (HTTP ${res.status})`)
+      }
+
+      const agent = await res.json()
+      console.log("agent result:", agent)
+
+      const action = agent.action || "curate"
+      const primaryId = agent.primary_id
+      const secondaryId = agent.secondary_id
+      const category = agent.category || "painting_json"
+
+      if (action === "compare" && primaryId && secondaryId) {
+        // 두 작품 비교
+        navigate(
+          `/compare?ids=${encodeURIComponent(primaryId)},${encodeURIComponent(
+            secondaryId
+          )}&category=${encodeURIComponent(category)}`
+        )
+      } else if (action === "tts" && primaryId) {
+        // 몰입형 TTS 투어
+        navigate(
+          `/immersive?id=${encodeURIComponent(
+            primaryId
+          )}&category=${encodeURIComponent(category)}`
+        )
+      } else if (primaryId) {
+        // 일반 상세 해설
+        navigate(
+          `/detail/${encodeURIComponent(
+            primaryId
+          )}?category=${encodeURIComponent(category)}`
+        )
+      } else {
+        // 아무것도 못 골랐을 때 → 갤러리
+        navigate(`/gallery?intent=${encodeURIComponent(q)}`)
+      }
+    } catch (e) {
+      console.error(e)
+      setError(
+        "AI 큐레이터 연결 중 문제가 발생했습니다. 갤러리에서 직접 작품을 선택해 주세요."
+      )
+      navigate(`/gallery?intent=${encodeURIComponent(overrideText || intent)}`)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleKeyDown = (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault()
+      handleStart()
+    }
+  }
+
+  // 예시 버튼 클릭: 인풋 채우고 바로 실행
+  const handleExampleClick = (prompt) => {
+    setIntent(prompt)
+    handleStart(prompt)
+  }
+
+  return (
+    <div
+      style={{
+        minHeight: "100vh",
+        position: "relative",
+        overflow: "hidden",
+        fontFamily:
+          "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+        color: "#2f2832",
+      }}
+    >
+      {/* 🖼 박물관/궁 배경 + 크림 톤 오버레이 */}
+      <div
+        style={{
+          position: "absolute",
+          inset: 0,
+          backgroundImage: `
+            linear-gradient(
+              to bottom,
+              rgba(255,255,255,0.55),
+              rgba(250,249,246,0.75),
+              rgba(245,242,236,0.9)
+            ),
+            url("/museum-bg.jpg")
+          `,
+          backgroundSize: "cover",
+          backgroundPosition: "center center",
+          backgroundRepeat: "no-repeat",
+          filter: "saturate(1.05)",
+          zIndex: 0,
+        }}
+      />
+
+      {/* 중앙 레이아웃 */}
+      <div
+        style={{
+          position: "relative",
+          zIndex: 1,
+          minHeight: "100vh",
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          padding: "40px 16px",
+          boxSizing: "border-box",
+        }}
+      >
+        {/* 타이틀 */}
+        <div style={{ textAlign: "center", marginBottom: "24px" }}>
+          <h1
+            style={{
+              margin: 0,
+              marginBottom: "6px",
+              fontSize: "clamp(30px, 4vw, 40px)",
+              fontWeight: 400,
+              letterSpacing: "0.04em",
+              color: "#2b2118",
+              fontFamily:
+                "'Nanum Myeongjo', 'Apple SD Gothic Neo', 'Malgun Gothic', serif",
+            }}
+          >
+            AI 큐레이터 전시장에 오신 것을 환영합니다
+          </h1>
+          <p
+            style={{
+              margin: 0,
+              marginTop: "6px",
+              fontSize: "13px",
+              color: "#6b7280",
+            }}
+          >
+            작품 한 점을 깊게 듣고, 두 작품을 비교하고, 한 작품 안으로 걸어 들어가
+            보세요.
+          </p>
+        </div>
+
+        {/* 카드형 영역 */}
+        <div
+          style={{
+            width: "100%",
+            maxWidth: "1050px",
+            borderRadius: "24px",
+            backgroundColor: "rgba(253,251,247,0.96)",
+            boxShadow: "0 18px 45px rgba(15, 23, 42, 0.22)",
+            border: "1px solid rgba(0,0,0,0.04)",
+            padding: "18px 22px",
+            boxSizing: "border-box",
+          }}
+        >
+          {/* 🔹 예시 질문 버튼들 */}
+          <div
+            style={{
+              marginBottom: "12px",
+              display: "flex",
+              flexWrap: "wrap",
+              gap: "8px",
+            }}
+          >
+            <span
+              style={{
+                fontSize: "12px",
+                color: "#9ca3af",
+                marginRight: "4px",
+                alignSelf: "center",
+              }}
+            >
+              예시로 바로 시작해 보기
+            </span>
+
+            {examplePrompts.map((ex, idx) => (
+              <button
+                key={idx}
+                type="button"
+                disabled={loading}
+                onClick={() => handleExampleClick(ex.prompt)}
+                style={{
+                  padding: "6px 10px",
+                  borderRadius: "999px",
+                  border: "1px solid #e5e7eb",
+                  backgroundColor: "#ffffff",
+                  fontSize: "12px",
+                  color: "#374151",
+                  cursor: loading ? "default" : "pointer",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {ex.label}
+              </button>
+            ))}
+          </div>
+
+          {/* 상단 입력창 */}
+          <textarea
+            value={intent}
+            onChange={(e) => setIntent(e.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder="오늘 어떤 전시를 보고 싶으신가요?"
+            disabled={loading}
+            style={{
+              width: "100%",
+              border: "none",
+              outline: "none",
+              resize: "none",
+              backgroundColor: "transparent",
+              fontSize: "16px",
+              lineHeight: 1.5,
+              minHeight: "40px",
+              maxHeight: "140px",
+              color: "#312525",
+              opacity: loading ? 0.6 : 1,
+            }}
+          />
+
+          {error && (
+            <div
+              style={{
+                marginTop: "8px",
+                fontSize: "13px",
+                color: "#b91c1c",
+              }}
+            >
+              {error}
+            </div>
+          )}
+
+          {/* 하단: 오른쪽 버튼 두 개 (갤러리 / AI 큐레이터) */}
+          <div
+            style={{
+              marginTop: "14px",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "flex-end",
+              gap: "8px",
+            }}
+          >
+            {/* 🔍 그냥 작품 목록 보기 */}
+            <button
+              type="button"
+              onClick={handleOpenGallery}
+              disabled={loading}
+              style={{
+                padding: "9px 16px",
+                borderRadius: "999px",
+                border: "1px solid #d1d5db",
+                backgroundColor: "white",
+                color: "#374151",
+                fontWeight: 500,
+                fontSize: "14px",
+                cursor: loading ? "default" : "pointer",
+              }}
+            >
+              전체 작품 갤러리 보기
+            </button>
+
+            {/* 🤖 AI 큐레이터 진입 */}
+            <button
+              type="button"
+              onClick={() => handleStart()}
+              disabled={loading}
+              style={{
+                padding: "9px 18px",
+                borderRadius: "999px",
+                border: "none",
+                backgroundColor: loading ? "#e5e7eb" : "#e2b48a",
+                color: "#332218",
+                fontWeight: 600,
+                fontSize: "14px",
+                cursor: loading ? "default" : "pointer",
+                whiteSpace: "nowrap",
+                boxShadow: loading
+                  ? "none"
+                  : "0 8px 20px rgba(139,92,55,0.35)",
+              }}
+            >
+              {loading
+                ? "AI 큐레이터가 전시를 준비 중..."
+                : "전시장으로 입장하기"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
