@@ -272,11 +272,19 @@ def retrieve_context(query: str, k: int = 5) -> List[Dict]:
     dists = res.get("distances", [[]])[0] if "distances" in res else [None] * len(ids)
 
     for i in range(len(ids)):
+        score = dists[i] if i < len(dists) else None
+        # 🔥 numpy.float32 → 파이썬 float로 강제 캐스팅
+        if score is not None:
+            try:
+                score = float(score)
+            except Exception:
+                score = None
+
         hits.append({
             "id": ids[i],
             "text": docs[i] if i < len(docs) else "",
             "meta": metas[i] if i < len(metas) else {},
-            "score": dists[i] if i < len(dists) else None,
+            "score": score,
         })
     return hits
 
@@ -323,19 +331,26 @@ def retrieve_image_context(query: str, k: int = 5) -> List[Dict]:
     dists = res.get("distances", [[]])[0] if "distances" in res else [None] * len(ids)
 
     for i in range(len(ids)):
+        score = dists[i] if i < len(dists) else None
+        if score is not None:
+            try:
+                score = float(score)
+            except Exception:
+                score = None
+
         hits.append(
             {
                 "id": ids[i],
                 "meta": metas[i] if i < len(metas) else {},
-                "score": dists[i] if i < len(dists) else None,
+                "score": score,
             }
         )
     return hits
 
-# ───────────────────────────────────────────────────────────
-# 유사한 작품 추천
-# ───────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────
+# CLIP 기반 유사 이미지 검색 (에러 나도 500 안 던지게)
+# ─────────────────────────────────────────────
 def similar_images_by_id(
     base_id: str,
     k: int = 5,
@@ -345,42 +360,101 @@ def similar_images_by_id(
     curator_image_clip 컬렉션 안에서
     - base_id 작품과 CLIP 기준으로 비슷한 작품 k개 찾기
     - category가 주어지면 같은 category만 필터링 (painting_json / craft_json / sculpture_json 등)
+
+    ⚠ 에러가 나더라도 HTTPException 안 던지고, 그냥 [] 리턴해서
+      프론트에서는 "유사한 작품을 찾지 못했습니다." 로 처리되게 만든다.
     """
-    if not use_image_retriever or not image_collection:
-        raise HTTPException(status_code=500, detail="image retriever disabled")
+    if not use_image_retriever or image_collection is None:
+        print("[similar_images_by_id] image retriever disabled")
+        return []
 
     # 1) 기준 작품의 embedding 꺼내기
-    doc = image_collection.get(
-        ids=[base_id],
-        include=["embeddings", "metadatas"],
-    )
-    if not doc or not doc.get("embeddings"):
-        raise HTTPException(status_code=404, detail=f"no embedding for id={base_id}")
+    try:
+        doc = image_collection.get(
+            ids=[base_id],
+            include=["embeddings", "metadatas"],
+        )
+    except Exception as e:
+        print(f"[similar_images_by_id] get() error for id={base_id} -> {e}")
+        return []
 
-    base_emb = doc["embeddings"][0]  # List[float]
-    base_meta = (doc.get("metadatas") or [{}])[0]
+    embeddings = doc.get("embeddings")
+    if embeddings is None:
+        print(f"[similar_images_by_id] no embeddings field for id={base_id}")
+        return []
+
+    # Chroma가 numpy array로 줄 수도 있어서 list로 강제 변환
+    if hasattr(embeddings, "tolist"):
+        embeddings = embeddings.tolist()
+
+    # 보통 [[...]] 형태라 첫 번째 요소 꺼냄
+    if len(embeddings) == 0:
+        print(f"[similar_images_by_id] empty embeddings for id={base_id}")
+        return []
+
+    base_emb = embeddings[0]
+    if hasattr(base_emb, "tolist"):
+        base_emb = base_emb.tolist()
+
+    base_meta_list = doc.get("metadatas") or [{}]
+    base_meta = base_meta_list[0] if base_meta_list else {}
 
     # 2) 이 embedding으로 근접 이웃 검색
-    res = image_collection.query(
-        query_embeddings=[base_emb],
-        n_results=k + 5,  # 자기 자신 + 다른 카테고리 제외 고려해서 여유 있게
-    )
+    try:
+        res = image_collection.query(
+            query_embeddings=[base_emb],
+            n_results=k + 10,  # 자기 자신 + 카테고리 필터 고려해서 여유 있게
+        )
+    except Exception as e:
+        print(f"[similar_images_by_id] query() error for id={base_id} -> {e}")
+        return []
 
-    ids = res.get("ids", [[]])[0]
-    metas = res.get("metadatas", [[]])[0]
-    dists = res.get("distances", [[]])[0] if "distances" in res else [None] * len(ids)
+    raw_ids = res.get("ids")
+    if raw_ids is None or len(raw_ids) == 0:
+        return []
+
+    ids = raw_ids[0]
+    if not isinstance(ids, list):
+        ids = list(ids)
+
+    raw_metas = res.get("metadatas")
+    if raw_metas is None or len(raw_metas) == 0:
+        metas = [{} for _ in ids]
+    else:
+        metas = raw_metas[0]
+        if not isinstance(metas, list):
+            metas = list(metas)
+
+    raw_dists = res.get("distances")
+    if raw_dists is None or len(raw_dists) == 0:
+        dists = [None] * len(ids)
+    else:
+        dists = raw_dists[0]
+        if not isinstance(dists, list):
+            dists = list(dists)
 
     items: List[Dict] = []
+
     for i, cid in enumerate(ids):
+        # 자기 자신은 제외
         if cid == base_id:
-            continue  # 자기 자신 제외
+            continue
 
         meta = metas[i] if i < len(metas) else {}
         score = dists[i] if i < len(dists) else None
 
-        # category 필터 (painting_json / craft_json / sculpture_json 등)
-        if category and meta.get("category") and meta.get("category") != category:
-            continue
+        # numpy.float32 → float
+        if score is not None:
+            try:
+                score = float(score)
+            except Exception:
+                score = None
+
+        # category 필터
+        if category:
+            m_cat = meta.get("category")
+            if m_cat is not None and m_cat != category:
+                continue
 
         items.append(
             {
@@ -389,8 +463,8 @@ def similar_images_by_id(
                 "artist": meta.get("artist", ""),
                 "class": meta.get("class", ""),
                 "year": meta.get("year", ""),
-                "category": meta.get("category"),         # ex) "painting_json"
-                "image_path": meta.get("image_path"),     # 프론트에서 img src로 쓰기
+                "category": meta.get("category"),       # ex) "painting_json"
+                "image_path": meta.get("image_path"),   # 프론트에서 img src로 쓰기
                 "score": score,
             }
         )
@@ -399,6 +473,7 @@ def similar_images_by_id(
             break
 
     return items
+
 
 
 # ───────────────────────────────────────────────────────────
@@ -618,31 +693,7 @@ def search_image(q: str, k: int = 5):
         ]
     }
 
-@app.get("/similar_images")
-def similar_images(
-    id: str,
-    k: int = 5,
-    category: Optional[str] = None,
-):
-    """
-    특정 작품 id 기준으로 CLIP 유사도 Top-k 추천.
-    - id: 기준 작품 id (curator_image_clip에 이미 인덱싱되어 있어야 함)
-    - category: 같은 카테고리만 보고 싶으면 "painting_json" / "craft_json" / "sculpture_json" 등 넣기
-                None이면 카테고리 상관없이 전부에서 검색
-    """
-    try:
-        items = similar_images_by_id(base_id=id, k=k, category=category)
-    except HTTPException:
-        # FastAPI가 알아서 처리함
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"similar_images failed: {e}")
 
-    return {
-        "base_id": id,
-        "category": category,
-        "items": items,
-    }
 
 @app.post("/ai/agent")
 async def agent_route(req: AgentIn):
@@ -995,3 +1046,54 @@ async def tts_route(req: TtsIn):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"TTS 실패: {e}")
+
+# ───────────────────────────────────────────────────────────
+# 유사한 이미지 엔드포인트
+# ───────────────────────────────────────────────────────────    
+    
+@app.get("/similar_images")
+def similar_images(
+    id: str,
+    category: Optional[str] = None,
+    k: int = 6,
+):
+    """
+    프론트에서 요청하는 유사 작품 추천 API
+
+    - 성공: {"items": [ ... ]}
+    - 실패/에러: {"items": []}   ← 500 안 던지고 그냥 빈 배열
+    """
+    # 이미지 검색 기능이 꺼져 있으면 바로 빈 리스트
+    if not use_image_retriever or image_collection is None:
+        print("[/similar_images] image retriever disabled")
+        return {"items": []}
+
+    try:
+        items = similar_images_by_id(
+            base_id=id,
+            k=k,
+            category=category,
+        )
+        # 항상 items 키로 리턴 (프론트 Detail.jsx와 맞추기)
+        return {"items": items}
+    except Exception as e:
+        # 여기서도 500 던지지 말고, 그냥 빈 items로 처리
+        print(f"[/similar_images] error for id={id}: {e}")
+        return {"items": []}
+    
+@app.get("/db_ids")
+def db_ids():
+    if image_collection is None:
+        return {"ids": [], "note": "image_collection is None"}
+
+    try:
+        res = image_collection.get()
+        ids = res.get("ids", [])
+        # numpy array 방어
+        if not isinstance(ids, list):
+            ids = list(ids)
+        return {"ids": ids}
+    except Exception as e:
+        return {"error": str(e), "ids": []}
+
+    
