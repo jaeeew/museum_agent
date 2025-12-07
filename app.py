@@ -714,7 +714,7 @@ async def agent_route(req: AgentIn):
 
     fallback_cat = req.category or "painting_json"
 
-        # 1) 의미 검색 (후보 작품 리스트)
+    # 1) 의미 검색 (후보 작품 리스트)
     #    - 텍스트 RAG(Gemini) + 이미지 RAG(CLIP) 둘 다에서 후보를 가져와 합침
     text_hits = retrieve_context(q, k=4)          # 메타데이터 기반
     image_hits = retrieve_image_context(q, k=4)   # 시각적/스타일 기반
@@ -1010,6 +1010,7 @@ async def analyze_compare(req: CompareIn):
 # ───────────────────────────────────────────────────────────
 # Google Cloud TTS 엔드포인트
 # ───────────────────────────────────────────────────────────
+
 @app.post("/ai/tts")
 async def tts_route(req: TtsIn):
     """
@@ -1020,19 +1021,40 @@ async def tts_route(req: TtsIn):
     if not text:
         raise HTTPException(status_code=400, detail="text가 비어 있습니다.")
 
+    # 프론트에서 넘어온 값 정리
+    language_code = (req.language_code or "ko-KR").strip()
+
+    # Immersive.jsx에서 female/male 토글로 넘겨주는 voice_name 사용
+    # - female: "ko-KR-Wavenet-A"
+    # - male  : "ko-KR-Wavenet-B"
+    voice_name = (req.voice_name or "").strip() or "ko-KR-Wavenet-A"
+
+    # 백엔드에서는 기본 1.0으로 두고, 실제 배속은 브라우저 audio.playbackRate로 제어
+    # (그래도 혹시 몰라 넘겨줄 값이 있으면 사용)
+    try:
+        speaking_rate = float(req.speaking_rate or 1.0)
+    except (TypeError, ValueError):
+        speaking_rate = 1.0
+
+    # 너무 극단적인 값 방지 (선택사항)
+    if speaking_rate < 0.7:
+        speaking_rate = 0.7
+    if speaking_rate > 2.0:
+        speaking_rate = 2.0
+
     try:
         client = texttospeech.TextToSpeechClient()
 
         synthesis_input = texttospeech.SynthesisInput(text=text)
 
         voice_params = texttospeech.VoiceSelectionParams(
-            language_code=req.language_code or "ko-KR",
-            name=req.voice_name or "ko-KR-Standard-A",  # 기본 한국어 음성
+            language_code=language_code,
+            name=voice_name,  # 프론트에서 온 Wavenet 이름 그대로 사용
         )
 
         audio_config = texttospeech.AudioConfig(
             audio_encoding=texttospeech.AudioEncoding.MP3,
-            speaking_rate=req.speaking_rate or 1.0,
+            speaking_rate=speaking_rate,
         )
 
         response = client.synthesize_speech(
@@ -1045,8 +1067,11 @@ async def tts_route(req: TtsIn):
         return {"audio_b64": audio_b64}
 
     except Exception as e:
+        # 디버깅 편하게 약간 로그 찍어도 좋음
+        print("[/ai/tts] error:", e)
         raise HTTPException(status_code=500, detail=f"TTS 실패: {e}")
-
+    
+    
 # ───────────────────────────────────────────────────────────
 # 유사한 이미지 엔드포인트
 # ───────────────────────────────────────────────────────────    
