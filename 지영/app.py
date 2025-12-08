@@ -40,31 +40,24 @@ model = genai.GenerativeModel(MODEL_NAME)
 # ───────────────────────────────────────────────────────────
 # 데이터 루트 (작품 JSON/이미지 경로)
 # ───────────────────────────────────────────────────────────
-# 네 실제 데이터 위치:
-# D:\207.디지털 K-Art 데이터\digital_kart_data\Exhibit
-DATA_ROOT = Path(os.environ.get(
-    "DATA_ROOT", 
-    r"D:\207.디지털 K-Art 데이터\digital_kart_data\Exhibit"
-))
-
+DATA_ROOT = Path(os.environ.get("DATA_ROOT", r"D:\Exhibit"))
 JSON_ROOT = DATA_ROOT / "json_extracted"
 IMG_ROOT  = DATA_ROOT / "image_extracted"
 
-
 # ───────────────────────────────────────────────────────────
 # 카테고리 별명 → 실제 폴더명 매핑
-# (네 실제 폴더 이름이 그대로 'craft_json', 'painting_json', 'sculpture_json' 이므로)
 # ───────────────────────────────────────────────────────────
 CATEGORY_MAP: Dict[str, str] = {
-    "painting_json": "painting_json",
-    "craft_json": "craft_json",
-    "sculpture_json": "sculpture_json",
+    "painting_json": "TL_01. 2D_02.회화(Json)",
+    "craft_json":    "TL_01. 2D_04.공예(Json)",
+    "sculpture_json": "TL_01. 2D_06.조각(Json)",
 }
 
 def map_category(cat: Optional[str]) -> Optional[str]:
     if not cat:
         return None
     return CATEGORY_MAP.get(cat, cat)
+
 
 # ───────────────────────────────────────────────────────────
 # Chroma(벡터DB) + Gemini 텍스트 RAG 컬렉션
