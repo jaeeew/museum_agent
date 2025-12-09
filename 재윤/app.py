@@ -164,6 +164,7 @@ except Exception as e:
 # 같은 작품을 다시 열 때 Gemini를 다시 부르지 않도록 하는 캐시
 CURATION_CACHE: Dict[str, str] = {}          # id -> curator_text
 IMMERSIVE_CACHE: Dict[str, Dict] = {}        # id -> {"text": str, "labels": List[str]}
+COMPARE_CACHE: Dict[str, Dict] = {}          # key -> response dict
 
 # 같은 텍스트에 대해 TTS를 다시 호출하지 않도록 하는 캐시
 from hashlib import md5
@@ -1240,6 +1241,8 @@ async def curate(req: CurateIn):
     # 1) 캐시 먼저 확인
     if card_id and card_id in CURATION_CACHE:
         print(f"[curate] CACHE HIT for {card_id}")
+        # 🔥 여기서 10초 정도 "생각하는" 연출
+        await asyncio.sleep(10)
         return {
             "curator_text": CURATION_CACHE[card_id],
             "retrieved": [],
@@ -1300,6 +1303,8 @@ async def curate_immersive(req: CurateImmersiveIn):
         # 2) 캐시 먼저 확인 (카테고리까지 포함된 키 사용)
         if cache_key and cache_key in IMMERSIVE_CACHE:
             cached = IMMERSIVE_CACHE[cache_key]
+            # 🔥 여기서 10초 딜레이
+            await asyncio.sleep(10)
             return {
                 "curator_text": cached.get("text", ""),
                 "labels": cached.get("labels", []),
@@ -1896,6 +1901,20 @@ async def analyze_compare(req: CompareIn):
 
     id_a, id_b = req.ids[0], req.ids[1]
 
+    # 🔑 A-B, B-A 순서 상관없이 같은 키가 되도록 정렬
+    sorted_ids = sorted([id_a, id_b])
+    pair_key = "::".join(sorted_ids)
+    cat_key = req.category or "any"
+    cache_key = f"{cat_key}::{pair_key}"
+
+    # 0) 캐시 먼저 확인 + 10초 딜레이
+    if cache_key in COMPARE_CACHE:
+        print(f"[analyze_compare] CACHE HIT for {cache_key}")
+        await asyncio.sleep(10)  # 🔥 "생각하는" 연출 10초
+        return COMPARE_CACHE[cache_key]
+
+    print(f"[analyze_compare] CACHE MISS for {cache_key}")
+
     # 1) 카드 로드 (json_extracted에서)
     card_a = load_card_by_id(req.category, id_a)
     card_b = load_card_by_id(req.category, id_b)
@@ -1938,8 +1957,8 @@ async def analyze_compare(req: CompareIn):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
 
+    # (옵션) 요약본 만들고 싶을 때 쓰려고 만들었던 헬퍼 – 지금은 안 써도 됨
     def to_brief(card: Dict, fallback_id: str) -> Dict:
-        # card 안에서 여러 후보 키 중 첫 번째로 값이 있는 것을 골라주는 헬퍼
         def first(*keys):
             for k in keys:
                 v = card.get(k)
@@ -1949,31 +1968,26 @@ async def analyze_compare(req: CompareIn):
 
         return {
             "id": card.get("id") or fallback_id,
-            # 제목
             "title": first(
                 "title",
                 "title_kor", "title_kr", "title_ko",
                 "title_eng", "title_en",
             ),
-            # 작가
             "artist": first(
                 "artist",
                 "artist_kor", "artist_kr", "artist_ko",
                 "artist_eng", "artist_en",
             ),
-            # 분류
             "class": first(
                 "class",
                 "class_kor", "class_kr", "class_ko",
                 "class_eng", "class_en",
             ),
-            # 연도/시기
             "year": first(
                 "year",
                 "date_or_period",
                 "photo_date",
             ),
-            # 재질
             "material": first(
                 "material",
                 "material_kor", "material_kr", "material_ko",
@@ -1981,7 +1995,8 @@ async def analyze_compare(req: CompareIn):
             ),
         }
 
-    return {
+    # 4) 최종 결과 + 캐시 저장
+    result = {
         "left": card_a,   # 요약본 대신 원본 카드 그대로
         "right": card_b,
         "analysis": text,
@@ -1990,6 +2005,9 @@ async def analyze_compare(req: CompareIn):
             for h in hits
         ],
     }
+
+    COMPARE_CACHE[cache_key] = result
+    return result
 
 # ───────────────────────────────────────────────────────────
 # Google Cloud TTS 엔드포인트

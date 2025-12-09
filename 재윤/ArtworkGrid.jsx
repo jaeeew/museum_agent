@@ -223,7 +223,7 @@ export default function ArtworkGrid() {
   })()
 
   const prettyCategoryName = (() => {
-    if (category === "painting_json") return "회화 갤러리"
+    if (category === "painting_json") return "갤러리"
     if (category === "craft_json") return "공예 갤러리"
     if (category === "sculpture_json") return "조각 갤러리"
     return category
