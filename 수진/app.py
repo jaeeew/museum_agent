@@ -1,474 +1,1036 @@
-from flask import Flask, render_template_string, request, send_from_directory, url_for
-import pandas as pd
-from pathlib import Path
 import os
 import json
+import random
+from typing import Optional, Dict, List
+from pathlib import Path
+from functools import lru_cache
 
-# ✅ Gemini SDK
-from google import genai  # pip install google-genai
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from dotenv import load_dotenv
 
-app = Flask(__name__)
+import base64
 
-# ======================
-#  데이터 로드
-# ======================
-DATA_PATH = Path(r"E:\207.디지털 K-Art 데이터\01-1.정식개방데이터\k_art_metadata.csv")
-df = pd.read_csv(DATA_PATH, encoding="utf-8-sig")
-df = df[df["img_path"].notna()].reset_index(drop=True)
-df["idx"] = df.index  # 각 작품 고유 인덱스
+# ── Google Gemini ─────────────────────────────────
+import google.generativeai as genai
 
-# ======================
-#  Gemini 클라이언트
-# ======================
-gemini_client = genai.Client()  # GEMINI_API_KEY 환경변수 사용
+# ── Google Cloud TTS (옵션) ───────────────────────
+from google.cloud import texttospeech
+
+# ── Chroma + Gemini 임베딩 ───────────────────────
+import chromadb
+from chromadb import Settings
+from chromadb.utils.embedding_functions import EmbeddingFunction
+
+# ── CLIP (텍스트/이미지 임베딩) ───────────────────
+import torch
+import open_clip  # pip install open_clip_torch
+from PIL import Image
 
 
-def generate_gemini_description(row):
-    """짧은 큐레이터 설명"""
-    title = row.get("title_kor") or row.get("title_eng") or "제목 없음"
-    artist = row.get("artist_kor") or row.get("artist_eng") or "미상"
-    period = row.get("main_category") or "-"
-    art_class = row.get("class_kor") or row.get("class_eng") or "-"
-    material = row.get("material_kor") or row.get("material_eng") or "-"
-    location = row.get("location_kor") or row.get("location_eng") or "-"
+# ─────────────────────────────────────────────────
+# 환경설정
+# ─────────────────────────────────────────────────
+load_dotenv()
 
-    prompt = f"""
-너는 한국 미술 전문 큐레이터야.
-아래 작품 정보를 보고 일반 관람객에게 5~8문장 정도로 설명해 줘.
+API_KEY = os.environ.get("GOOGLE_API_KEY")
+MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "text-embedding-004")
 
-- 작품 제목: {title}
-- 작가: {artist}
-- 시대/연대: {period}
-- 분류(장르): {art_class}
-- 재질: {material}
-- 소장처: {location}
+if API_KEY:
+    genai.configure(api_key=API_KEY)
 
-설명할 때는 다음을 지켜 줘:
-1. 첫 문장은 이 작품의 인상을 한 문장으로 요약해 줘.
-2. 너무 학술적이지 말고, 누구나 이해할 수 있는 쉬운 표현을 사용해.
-3. 이 작품의 미술사적/문화적 의미나 특징을 2~3가지 짚어 줘.
-4. 마지막 문장은 "이 작품을 볼 때 ○○을(를) 함께 떠올려 보세요." 형태의 감상 팁으로 끝내 줘.
-"""
+model = genai.GenerativeModel(MODEL_NAME)
 
-    response = gemini_client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
+
+# ─────────────────────────────────────────────────
+# 데이터 루트 (작품 JSON/이미지 경로)
+#   예: E:\207.디지털 K-Art 데이터\01-1.정식개방데이터
+# ─────────────────────────────────────────────────
+DATA_ROOT = Path(
+    os.environ.get(
+        "DATA_ROOT",
+        r"E:\207.디지털 K-Art 데이터\01-1.정식개방데이터",
     )
-    return response.text
+)
+
+# JSON은 Training/02.라벨링데이터 아래 TL_01... 폴더
+JSON_ROOT = DATA_ROOT / "Training" / "02.라벨링데이터"
+
+# 이미지는 Training + Validation 통째로 검색
+IMG_ROOT = DATA_ROOT
+
+IMAGE_EXTS = ("jpg", "jpeg", "png", "JPG", "JPEG", "PNG")
 
 
-def generate_gemini_narration(row):
+@lru_cache(maxsize=1)
+def build_image_index() -> Dict[str, str]:
     """
-    Immersive 모드용 단계별 도슨트 내레이션 생성.
-    4~6개의 단계로 나눠서 한두 문장씩 설명하도록 요청.
+    IMG_ROOT 전체를 한 번만 스캔해서
+    파일이름(stem) → 상대경로 를 캐싱해 둔다.
     """
-    title = row.get("title_kor") or row.get("title_eng") or "제목 없음"
-    artist = row.get("artist_kor") or row.get("artist_eng") or "미상"
-    period = row.get("main_category") or "-"
-    art_class = row.get("class_kor") or row.get("class_eng") or "-"
-    material = row.get("material_kor") or row.get("material_eng") or "-"
-    location = row.get("location_kor") or row.get("location_eng") or "-"
+    index: Dict[str, str] = {}
+    print("[IMAGE_INDEX] building index...")
+    for ext in IMAGE_EXTS:
+        for path in IMG_ROOT.rglob(f"*.{ext}"):
+            stem = path.stem  # kart_2d000645-C-8-81-1
+            rel = path.relative_to(IMG_ROOT).as_posix()
+            if stem not in index:
+                index[stem] = rel
+    print(f"[IMAGE_INDEX] built index for {len(index)} images")
+    return index
 
-    prompt = f"""
-너는 한국 미술관의 전문 도슨트야.
-아래 작품을 관람객과 함께 감상한다고 생각하고, 4~6단계로 나누어 '투어 내레이션'을 만들어 줘.
 
-각 단계는 1~2문장 정도로 해 줘.
-번호는 쓰지 말고, 각 단계마다 줄바꿈만 해서 구분해 줘.
+def find_image_path_for_prefix(prefix: str) -> Optional[Path]:
+    """
+    build_image_index()를 사용해서 prefix에 해당하는 실제 이미지 Path 반환
+    """
+    index = build_image_index()
 
-특히 다음과 같은 표현을 적절히 섞어 줘:
-- "왼쪽 아래를 한 번 보세요..."
-- "이제 시선을 화면 중앙으로 옮겨 볼까요?"
-- "오른쪽 부분을 보면..."
-- "이제 한 걸음 물러나 전체를 바라보면..."
+    # 1) 완전 일치
+    rel = index.get(prefix)
+    if rel:
+        return IMG_ROOT / rel
 
-작품 정보:
-- 작품 제목: {title}
-- 작가: {artist}
-- 시대/연대: {period}
-- 분류(장르): {art_class}
-- 재질: {material}
-- 소장처: {location}
-"""
+    # 2) prefix로 시작하는 것
+    for k, v in index.items():
+        if k.startswith(prefix):
+            return IMG_ROOT / v
 
-    response = gemini_client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
+    return None
+
+
+# ─────────────────────────────────────────────────
+# 카테고리 별명 → 실제 폴더명 매핑
+# ─────────────────────────────────────────────────
+CATEGORY_MAP: Dict[str, str] = {
+    "painting_json": "TL_01. 2D_02.회화(Json)",
+    "craft_json": "TL_01. 2D_04.공예(Json)",
+    "sculpture_json": "TL_01. 2D_06.조각(Json)",
+}
+
+
+def map_category(cat: Optional[str]) -> Optional[str]:
+    if not cat:
+        return None
+    return CATEGORY_MAP.get(cat, cat)
+
+
+# ─────────────────────────────────────────────────
+# Chroma (텍스트 RAG + Gemini 임베딩)
+# ─────────────────────────────────────────────────
+use_retriever = True
+use_image_retriever = True
+
+retrieval = None
+image_collection = None
+
+
+class GeminiEF(EmbeddingFunction):
+    def __call__(self, texts: List[str]) -> List[List[float]]:
+        out: List[List[float]] = []
+        for t in texts:
+            r = genai.embed_content(model=EMBED_MODEL, content=t)
+            out.append(r["embedding"])
+        return out
+
+
+try:
+    # 텍스트 RAG
+    text_client = chromadb.PersistentClient(
+        path="./chroma_text",
+        settings=Settings(anonymized_telemetry=False),
     )
-    text = response.text.strip()
-    lines = [line.strip(" -•\n") for line in text.splitlines() if line.strip()]
-    if len(lines) > 6:
-        lines = lines[:6]
-    return lines
+    retrieval = text_client.get_or_create_collection(
+        name="curator_corpus",
+        embedding_function=GeminiEF(),
+        metadata={"hnsw:space": "cosine"},
+    )
+
+    # 이미지 RAG (CLIP 임베딩이 이미 들어있다고 가정)
+    image_client = chromadb.PersistentClient(
+        path="./chroma_image",
+        settings=Settings(anonymized_telemetry=False),
+    )
+    image_collection = image_client.get_or_create_collection(
+        name="curator_image_clip",
+        metadata={"hnsw:space": "cosine"},
+    )
+
+except Exception as e:
+    print("[WARN] Chroma 초기화 실패:", e)
+    use_retriever = False
+    use_image_retriever = False
+    retrieval = None
+    image_collection = None
 
 
-# ======================
-#  HTML 템플릿
-# ======================
+# ─────────────────────────────────────────────────
+# CLIP 모델 (텍스트→이미지 검색 / 이미지 분석)
+# ─────────────────────────────────────────────────
+try:
+    CLIP_MODEL_NAME = "ViT-B-32"
+    CLIP_PRETRAINED = "laion2b_s34b_b79k"
 
-LIST_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>K-Art AI 큐레이터</title>
-    <style>
-        body { font-family: 'Noto Sans KR', sans-serif; background-color: #fafafa; margin: 40px; }
-        .art { display: flex; margin-bottom: 40px; background: white; border-radius: 12px;
-               box-shadow: 0 0 10px rgba(0,0,0,0.05); padding: 20px; align-items: flex-start; }
-        .art img { width: 260px; height: auto; border-radius: 8px; margin-right: 20px; object-fit: contain; }
-        .info h2 { margin-top: 0; }
-        .search { margin-bottom: 30px; }
-        a { text-decoration: none; color: #0044aa; }
-        a:hover { text-decoration: underline; }
-        .btn-detail { display:inline-block; margin-top:10px; padding:6px 10px; border-radius:6px;
-                      background:#f0f4ff; font-size:0.9rem; }
-    </style>
-</head>
-<body>
-    <h1>🎨 K-Art AI 큐레이터</h1>
-    <form class="search" method="get" action="/">
-        <input type="text" name="q" placeholder="작품명·작가명·재질 검색" value="{{q}}" size="40">
-        <input type="submit" value="검색">
-        <a href="{{ url_for('home') }}">전체보기</a>
-    </form>
+    clip_device = "cuda" if torch.cuda.is_available() else "cpu"
+    clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(
+        CLIP_MODEL_NAME, pretrained=CLIP_PRETRAINED
+    )
+    clip_model = clip_model.to(clip_device)
+    clip_model.eval()
+    clip_tokenizer = open_clip.get_tokenizer(CLIP_MODEL_NAME)
 
-    {% for _, row in items.iterrows() %}
-        <div class="art">
-            {% if row['img_path'] %}
-                <img src="{{ url_for('serve_image', idx=row['idx']) }}" alt="이미지">
-            {% endif %}
-            <div class="info">
-                <h2><a href="{{ url_for('detail', idx=row['idx']) }}">{{ row['title_kor'] or row['title_eng'] or '제목 없음' }}</a></h2>
-                <p><b>작가:</b> {{ row['artist_kor'] or row['artist_eng'] or '정보 없음' }}</p>
-                <p><b>분류:</b> {{ row['class_kor'] or '-' }}</p>
-                <p><b>시대:</b> {{ row['main_category'] or '-' }}</p>
-                <p><b>재질:</b> {{ row['material_kor'] or '-' }}</p>
-                <p><b>소장처:</b> {{ row['location_kor'] or '-' }}</p>
-                <a class="btn-detail" href="{{ url_for('detail', idx=row['idx']) }}">🧠 AI 설명 보기</a>
-            </div>
-        </div>
-    {% endfor %}
-</body>
-</html>
-"""
+    @torch.no_grad()
+    def embed_clip_text(texts: List[str]) -> List[List[float]]:
+        if isinstance(texts, str):
+            texts = [texts]
+        tokens = clip_tokenizer(texts).to(clip_device)
+        feats = clip_model.encode_text(tokens)
+        feats /= feats.norm(dim=-1, keepdim=True)
+        return feats.cpu().tolist()
 
-DETAIL_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>{{ title }} - K-Art AI 큐레이터</title>
-    <style>
-        body { font-family: 'Noto Sans KR', sans-serif; background-color: #fafafa; margin: 40px; }
-        .container {
-            max-width: 1000px;
-            margin: 40px auto;
-            background:white;
-            padding:30px;
-            border-radius:12px;
-            box-shadow:0 0 12px rgba(0,0,0,0.07);
-        }
+    @torch.no_grad()
+    def embed_clip_image(img_path: Path) -> Optional[List[float]]:
+        if not img_path.exists():
+            return None
+        img = Image.open(img_path).convert("RGB")
+        image_tensor = clip_preprocess(img).unsqueeze(0).to(clip_device)
+        feats = clip_model.encode_image(image_tensor)
+        feats /= feats.norm(dim=-1, keepdim=True)
+        return feats[0].cpu().tolist()
 
-        /* ✅ 이미지 프레임: 이 안에서만 과감하게 줌 */
-        .image-frame {
-            width: 100%;
-            max-height: 600px;
-            overflow: hidden;
-            border-radius: 12px;
-            margin-bottom: 20px;
-            position: relative;
-            background: #000;
-        }
+except Exception as e:
+    print("[WARN] CLIP 초기화 실패:", e)
+    use_image_retriever = False
+    clip_model = None
+    clip_tokenizer = None
+    clip_preprocess = None
 
-        #art-image {
-            width: 100%;
-            height: auto;
-            border-radius: 0;
-            transition: transform 2.8s ease, transform-origin 2.8s ease;
-            transform-origin: 50% 50%;
-        }
 
-        a { text-decoration:none; color:#0044aa; }
-        a:hover { text-decoration:underline; }
-        .meta p { margin: 3px 0; }
-        .desc {
-            background:#f6f7ff;
-            padding:15px 20px;
-            border-radius:10px;
-            white-space:pre-line;
-            margin-top: 15px;
-        }
-        .tts-buttons {
-            margin-top: 10px;
-        }
-        .tts-buttons button {
-            margin-right: 8px;
-            padding:6px 10px;
-            border-radius:6px;
-            border:none;
-            cursor:pointer;
-            background:#ffe9f0;
-            font-weight:bold;
-        }
-        .tts-buttons button:hover {
-            background:#ffd6e3;
-        }
-    </style>
-</head>
-<body>
-    <a href="{{ url_for('home') }}">← 목록으로 돌아가기</a>
-    <div class="container">
-        <h1>{{ title }}</h1>
-        {% if img_url %}
-            <div class="image-frame">
-                <img id="art-image" src="{{ img_url }}" alt="이미지">
-            </div>
-        {% endif %}
+# ─────────────────────────────────────────────────
+# FastAPI 앱 & CORS
+# ─────────────────────────────────────────────────
+app = FastAPI()
 
-        <div class="meta">
-            <p><b>작가:</b> {{ artist }}</p>
-            <p><b>분류:</b> {{ art_class }}</p>
-            <p><b>시대:</b> {{ period }}</p>
-            <p><b>재질:</b> {{ material }}</p>
-            <p><b>소장처:</b> {{ location }}</p>
-        </div>
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
+        "http://localhost:8001",
+        "http://127.0.0.1:8001",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-        <h3>🧠 AI 큐레이터 설명 (Gemini)</h3>
+# 이미지
+app.mount(
+    "/image_extracted",
+    StaticFiles(directory=str(IMG_ROOT)),
+    name="images",
+)
 
-        <!-- 🔊 기본 설명 TTS + Immersive 투어 버튼 -->
-        <div class="tts-buttons">
-            <button onclick="speakDesc()">🔊 설명 듣기</button>
-            <button onclick="stopDesc()">⏹ 멈추기</button>
-            <button onclick="startTour()">🎧 작품 속으로 들어가기</button>
-            <button onclick="stopTour()">⏹ 투어 멈추기</button>
-        </div>
+# JSON
+app.mount(
+    "/json_extracted",
+    StaticFiles(directory=str(JSON_ROOT)),
+    name="json",
+)
 
-        <!-- 설명 텍스트 -->
-        <div id="desc-text" class="desc">
-            {{ description }}
-        </div>
-    </div>
 
-    <!-- narration 데이터 (JS에서 사용) -->
-    <script>
-        const tourNarration = {{ narration | safe }};
-    </script>
+# ─────────────────────────────────────────────────
+# Pydantic 모델
+# ─────────────────────────────────────────────────
+class CurateIn(BaseModel):
+    id: str
+    card: Optional[Dict] = None
 
-    <!-- 🧠 음성 읽기 + Immersive 투어 (Web Speech API) -->
-    <script>
-        let docentVoice = null;
 
-        function pickKoreanVoice() {
-            const voices = window.speechSynthesis.getVoices();
-            if (!voices || voices.length === 0) return null;
+class CurateImmersiveIn(BaseModel):
+    id: Optional[str] = None
+    category: Optional[str] = None
+    card: Optional[Dict] = None
 
-            const koVoices = voices.filter(v => v.lang && v.lang.startsWith('ko'));
-            if (koVoices.length === 0) return null;
 
-            const preferredKeywords = ["natural", "neural", "online", "cloud", "han", "heami", "sunhi", "Google", "Microsoft"];
-            for (const v of koVoices) {
-                const nameLower = (v.name || "").toLowerCase();
-                if (preferredKeywords.some(k => nameLower.includes(k.toLowerCase()))) {
-                    return v;
-                }
+class CompareIn(BaseModel):
+    ids: List[str]
+    category: Optional[str] = None
+    locale: Optional[str] = "ko"
+
+
+class AgentIn(BaseModel):
+    query: str
+    category: Optional[str] = None
+    locale: Optional[str] = "ko"
+
+
+class TtsIn(BaseModel):
+    text: str
+    language_code: Optional[str] = "ko-KR"
+    voice_name: Optional[str] = None
+    speaking_rate: Optional[float] = 1.0
+
+
+# ─────────────────────────────────────────────────
+# 유틸: 카드 로딩
+# ─────────────────────────────────────────────────
+def load_card_by_id(category: Optional[str], art_id: str) -> Dict:
+    if category:
+        real_cat = map_category(category)
+        candidates = [JSON_ROOT / real_cat]
+    else:
+        candidates = [p for p in JSON_ROOT.iterdir() if p.is_dir()]
+
+    for cat_dir in candidates:
+        if not cat_dir.is_dir():
+            continue
+        target = cat_dir / f"{art_id}.json"
+        if target.exists():
+            with target.open("r", encoding="utf-8") as f:
+                card = json.load(f)
+            card.setdefault("id", art_id)
+            return card
+
+    raise HTTPException(
+        status_code=404,
+        detail=f"card not found for id={art_id}, category={category}",
+    )
+
+
+# ─────────────────────────────────────────────────
+# RAG 유틸
+# ─────────────────────────────────────────────────
+def build_query(card: Dict) -> str:
+    desc = card.get("Description") or {}
+    photo = card.get("Photo_Info") or {}
+    data_info = card.get("Data_Info") or {}
+
+    parts: List[Optional[str]] = [
+        card.get("title")
+        or desc.get("ArtTitle_kor")
+        or desc.get("ArtTitle_eng")
+        or data_info.get("ImageFileName"),
+        card.get("artist")
+        or desc.get("ArtistName_kor")
+        or desc.get("ArtistName_eng"),
+        card.get("class")
+        or desc.get("Class_kor")
+        or desc.get("Class_eng"),
+        card.get("material")
+        or desc.get("Material_kor")
+        or desc.get("Material_eng"),
+        card.get("date_or_period") or photo.get("PhotoDate"),
+    ]
+    return " ".join([p for p in parts if p])
+
+
+def retrieve_context(query: str, k: int = 5) -> List[Dict]:
+    if not use_retriever or not retrieval or not query:
+        return []
+    res = retrieval.query(query_texts=[query], n_results=k)
+    if not res or not res.get("ids"):
+        return []
+
+    hits: List[Dict] = []
+    ids = res["ids"][0]
+    docs = res.get("documents", [[]])[0]
+    metas = res.get("metadatas", [[]])[0]
+    dists = res.get("distances", [[]])[0] if "distances" in res else [None] * len(ids)
+
+    for i in range(len(ids)):
+        hits.append(
+            {
+                "id": ids[i],
+                "text": docs[i] if i < len(docs) else "",
+                "meta": metas[i] if i < len(metas) else {},
+                "score": dists[i] if i < len(dists) else None,
             }
-            return koVoices[0];
-        }
-
-        if ('speechSynthesis' in window) {
-            window.speechSynthesis.onvoiceschanged = () => {
-                docentVoice = pickKoreanVoice();
-                console.log("선택된 한국어 음성:", docentVoice ? docentVoice.name : "기본 음성");
-            };
-        }
-
-        function makeUtter(text) {
-            const utter = new SpeechSynthesisUtterance(text);
-            utter.lang = 'ko-KR';
-            utter.rate = 0.9;
-            utter.pitch = 0.95;
-            if (docentVoice) utter.voice = docentVoice;
-            return utter;
-        }
-
-        function speakDesc() {
-            if (!('speechSynthesis' in window)) {
-                alert('이 브라우저는 음성 읽기를 지원하지 않습니다.');
-                return;
-            }
-            const text = document.getElementById('desc-text').innerText.trim();
-            if (!text) return;
-
-            window.speechSynthesis.cancel();
-            const utter = makeUtter(text);
-            window.speechSynthesis.speak(utter);
-        }
-
-        function stopDesc() {
-            if ('speechSynthesis' in window) {
-                window.speechSynthesis.cancel();
-            }
-        }
-
-        // ===== Immersive 투어 =====
-        let tourIndex = 0;
-
-        function updateImageForStep(step) {
-            const img = document.getElementById('art-image');
-            if (!img) return;
-
-            let scale = 1.0;
-            let originX = "50%";
-            let originY = "50%";
-
-            if (step === 0) {
-                // 전체 첫인상
-                scale = 1.15;
-                originX = "50%"; originY = "50%";
-            } else if (step === 1) {
-                // 왼쪽 아래 크게
-                scale = 2.0;
-                originX = "20%"; originY = "80%";
-            } else if (step === 2) {
-                // 중앙 강하게
-                scale = 2.2;
-                originX = "50%"; originY = "40%";
-            } else if (step === 3) {
-                // 오른쪽 강조
-                scale = 2.0;
-                originX = "80%"; originY = "50%";
-            } else if (step === 4) {
-                // 다시 전체 쪽으로
-                scale = 1.1;
-                originX = "50%"; originY = "50%";
-            } else {
-                // 투어 종료: 원래대로
-                scale = 1.0;
-                originX = "50%"; originY = "50%";
-            }
-
-            img.style.transformOrigin = originX + " " + originY;
-            img.style.transform = "scale(" + scale + ")";
-
-            const frame = img.parentElement;
-            if (frame) {
-                const top = frame.getBoundingClientRect().top + window.scrollY;
-                window.scrollTo({ top: top - 40, behavior: 'smooth' });
-            }
-        }
-
-        function playTourStep() {
-            if (!('speechSynthesis' in window)) return;
-            if (!tourNarration || tourNarration.length === 0) return;
-            if (tourIndex >= tourNarration.length) {
-                updateImageForStep(999);
-                return;
-            }
-
-            const text = tourNarration[tourIndex];
-            if (!text) return;
-
-            window.speechSynthesis.cancel();
-            const utter = makeUtter(text);
-
-            utter.onstart = () => {
-                updateImageForStep(tourIndex);
-            };
-            utter.onend = () => {
-                tourIndex++;
-                playTourStep();
-            };
-
-            window.speechSynthesis.speak(utter);
-        }
-
-        function startTour() {
-            if (!('speechSynthesis' in window)) {
-                alert('이 브라우저는 음성 읽기를 지원하지 않습니다.');
-                return;
-            }
-            tourIndex = 0;
-            playTourStep();
-        }
-
-        function stopTour() {
-            if ('speechSynthesis' in window) {
-                window.speechSynthesis.cancel();
-            }
-            tourIndex = 0;
-            updateImageForStep(999);
-        }
-    </script>
-</body>
-</html>
-"""
-
-
-# ======================
-#  라우트
-# ======================
-
-@app.route("/")
-def home():
-    q = request.args.get("q", "")
-    results = df.copy()
-
-    if q:
-        q_str = q.strip()
-        mask = (
-            results["title_kor"].fillna("").str.contains(q_str, case=False)
-            | results["artist_kor"].fillna("").str.contains(q_str, case=False)
-            | results["material_kor"].fillna("").str.contains(q_str, case=False)
-            | results["location_kor"].fillna("").str.contains(q_str, case=False)
         )
-        results = results[mask]
-
-    # 최대 20개만 랜덤으로
-    if len(results) > 20:
-        results = results.sample(20)
-
-    return render_template_string(LIST_TEMPLATE, items=results, q=q)
+    return hits
 
 
-@app.route("/image/<int:idx>")
-def serve_image(idx):
-    row = df.iloc[idx]
-    img_path = Path(row["img_path"])
-    return send_from_directory(img_path.parent, img_path.name)
+def format_context(hits: List[Dict]) -> str:
+    if not hits:
+        return "(관련 자료 검색 결과 없음)"
+    lines: List[str] = []
+    for h in hits:
+        m = h.get("meta") or {}
+        head = f"■ {m.get('title','(제목 미상)')} / {m.get('artist','')} / {m.get('class','')}"
+        tail = f"[재질:{m.get('material','')}, 연도:{m.get('year','')}]"
+        lines.append(head)
+        lines.append(h.get("text", ""))
+        lines.append(tail)
+        lines.append("")
+    return "\n".join(lines)
 
 
-@app.route("/detail/<int:idx>")
-def detail(idx):
-    row = df.iloc[idx]
+def retrieve_image_context(query: str, k: int = 5) -> List[Dict]:
+    if not use_image_retriever or not image_collection or not query:
+        return []
 
-    title = row.get("title_kor") or row.get("title_eng") or "제목 없음"
-    artist = row.get("artist_kor") or row.get("artist_eng") or "미상"
-    period = row.get("main_category") or "-"
-    art_class = row.get("class_kor") or row.get("class_eng") or "-"
-    material = row.get("material_kor") or row.get("material_eng") or "-"
-    location = row.get("location_kor") or row.get("location_eng") or "-"
+    try:
+        vec = embed_clip_text([query])[0]
+    except Exception as e:
+        print("[WARN] CLIP embed 실패:", e)
+        return []
 
-    description = generate_gemini_description(row)
-    narration_steps = generate_gemini_narration(row)
+    res = image_collection.query(query_embeddings=[vec], n_results=k)
+    if not res or not res.get("ids"):
+        return []
 
-    img_url = None
-    if row.get("img_path"):
-        img_url = url_for("serve_image", idx=idx)
+    hits: List[Dict] = []
+    ids = res["ids"][0]
+    metas = res.get("metadatas", [[]])[0]
+    dists = res.get("distances", [[]])[0] if "distances" in res else [None] * len(ids)
 
-    return render_template_string(
-        DETAIL_TEMPLATE,
-        title=title,
-        artist=artist,
-        period=period,
-        art_class=art_class,
-        material=material,
-        location=location,
-        img_url=img_url,
-        description=description,
-        narration=json.dumps(narration_steps, ensure_ascii=False),
+    for i in range(len(ids)):
+        hits.append(
+            {
+                "id": ids[i],
+                "meta": metas[i] if i < len(metas) else {},
+                "score": dists[i] if i < len(dists) else None,
+            }
+        )
+    return hits
+
+
+# ─────────────────────────────────────────────────
+# CLIP 기반 라벨링
+# ─────────────────────────────────────────────────
+VISUAL_LABEL_CANDIDATES: Dict[str, List[str]] = {
+    "새": ["새", "작은 새 두 마리", "새 한 마리", "새가 앉아 있는 모습"],
+    "꽃": ["꽃", "매화 꽃", "벚꽃 가지", "꽃송이"],
+    "나뭇가지": ["나뭇가지", "가는 가지", "나무 가지", "매화 가지"],
+    "나무": ["나무", "큰 나무", "고목", "소나무"],
+    # 물·연못 계열
+    "물": ["물", "연못", "물결", "물가", "물 위의 반사"],
+    # 물고기/금붕어
+    "물고기": ["물고기", "금붕어", "연못 속 물고기", "헤엄치는 물고기"],
+    # 인물/동물/과일/글씨
+    "사람": ["사람", "인물 한 명", "인물 두 명", "선비 한 명"],
+    "다람쥐": ["다람쥐", "작은 다람쥐", "나뭇가지 위의 다람쥐"],
+    "과일": ["과일", "감", "귤", "복숭아", "포도", "나무에 달린 과일"],
+    "글씨": ["글씨", "서예", "먹으로 쓴 글씨", "한자 글씨"],
+}
+
+def _cos_sim(a: List[float], b: List[float]) -> float:
+    return float(sum(x * y for x, y in zip(a, b)))
+
+
+def analyze_image_labels(img_path: Path, top_k: int = 4) -> List[str]:
+    """
+    CLIP으로 이미지와 텍스트 후보를 비교해서
+    그 그림에 '있어 보이는' 대상 라벨을 상위 top_k개 뽑아줌.
+    """
+    if clip_model is None or embed_clip_image is None:
+        return []
+
+    try:
+        img_vec = embed_clip_image(img_path)
+    except Exception as e:
+        print("[WARN] CLIP 이미지 분석 실패:", e)
+        return []
+
+    if not img_vec:
+        return []
+
+    labels_with_scores: List[tuple[str, float]] = []
+
+    for label, phrases in VISUAL_LABEL_CANDIDATES.items():
+        try:
+            text_vecs = embed_clip_text(phrases)
+        except Exception as e:
+            print("[WARN] CLIP 텍스트 임베딩 실패:", e)
+            continue
+
+        best = max(_cos_sim(img_vec, tv) for tv in text_vecs)
+        labels_with_scores.append((label, float(best)))
+
+    labels_with_scores.sort(key=lambda x: x[1], reverse=True)
+
+    # 너무 애매한(점수 낮은) 라벨은 버림
+    filtered = [lb for lb, sc in labels_with_scores if sc > 0.27]
+    return filtered[:top_k]
+
+
+# ─────────────────────────────────────────────────
+# 프롬프트 빌더 (일반 텍스트 모드)
+# ─────────────────────────────────────────────────
+def build_prompt(card: Dict, context_block: str) -> str:
+    card = card or {}
+    desc = card.get("Description") or {}
+    photo = card.get("Photo_Info") or {}
+    data_info = card.get("Data_Info") or {}
+
+    title = (
+        card.get("title")
+        or desc.get("ArtTitle_kor")
+        or desc.get("ArtTitle_eng")
+        or data_info.get("ImageFileName")
+        or card.get("id", "")
+    )
+
+    artist = (
+        card.get("artist")
+        or desc.get("ArtistName_kor")
+        or desc.get("ArtistName_eng")
+        or ""
+    )
+
+    klass = (
+        card.get("class")
+        or desc.get("Class_kor")
+        or desc.get("Class_eng")
+        or ""
+    )
+
+    material = (
+        card.get("material")
+        or desc.get("Material_kor")
+        or desc.get("Material_eng")
+        or ""
+    )
+
+    year = card.get("date_or_period") or photo.get("PhotoDate") or ""
+
+    cats = " / ".join(card.get("categories", []) or [])
+    lines = [
+        "당신은 국공립 미술관의 전문 큐레이터입니다. 차분하고 따뜻한 말투로, 관람객에게 편안히 이야기하듯 한국어 구어체로 설명하세요.",
+        "설명은 3~4개의 짧은 단락, 총 5~7문장으로 작성합니다. 제목/번호/불릿/이모지/괄호 표시는 사용하지 마세요.",
+        "이 작품이 말하는 ‘핵심 의미/주제’를 서두 1~2문장에서 선명하게 제시하고, 나머지 정보는 배경 수준으로만 간결히 덧붙이세요.",
+        "형식·재료 분석은 핵심 1~2포인트만 짧게 언급하고, 감상 포인트도 1~2문장으로 권유형 종결을 사용하세요.",
+        "권리·이용범위·라이선스·파일 경로·출처 표기는 언급하지 마세요.",
+        "",
+        "### [검색 컨텍스트]",
+        context_block,
+        "",
+        "### [요청 카드]",
+        f"작품 제목: {title}",
+        f"작가: {artist}",
+        f"분류/장르: {klass}",
+        f"카테고리: {cats}",
+        f"재질: {material}",
+        f"연도/시기: {year}",
+        "",
+        "최종 출력에는 위의 메타/지침 섹션을 포함하지 말고, 단락 텍스트만 제시하세요.",
+    ]
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────
+# 프롬프트 빌더 (몰입형/Immersive 전용)
+# ─────────────────────────────────────────────────
+def build_immersive_prompt(
+    card: Dict,
+    context_block: str,
+    visual_labels: List[str],
+) -> str:
+    """
+    몰입형(TTS + 화면 이동) 전용 해설 프롬프트.
+
+    - visual_labels: CLIP으로 실제 이미지에서 검출된 단어들
+                     (예: ['새', '꽃', '물고기'] 등)
+    - 여기에 작품 제목/주제 같은 메타데이터에서 뽑은 단어들을 합쳐서
+      '이 목록 안에 있는 단어만 가지고 구체적인 대상을 설명해라'고 시킨다.
+    """
+    card = card or {}
+    desc = card.get("Description") or {}
+    photo = card.get("Photo_Info") or {}
+    data_info = card.get("Data_Info") or {}
+
+    title = (
+        card.get("title")
+        or desc.get("ArtTitle_kor")
+        or desc.get("ArtTitle_eng")
+        or data_info.get("ImageFileName")
+        or card.get("id", "")
+    )
+
+    artist = (
+        card.get("artist")
+        or desc.get("ArtistName_kor")
+        or desc.get("ArtistName_eng")
+        or ""
+    )
+
+    klass = (
+        card.get("class")
+        or desc.get("Class_kor")
+        or desc.get("Class_eng")
+        or ""
+    )
+
+    material = (
+        card.get("material")
+        or desc.get("Material_kor")
+        or desc.get("Material_eng")
+        or ""
+    )
+
+    year = (
+        card.get("date_or_period")
+        or photo.get("PhotoDate")
+        or desc.get("Period_kor")
+        or desc.get("Period_eng")
+        or ""
+    )
+
+    # 제목/분류/주제 같은 메타데이터에서 단어를 조금 더 가져와서
+    # CLIP 라벨과 합친다. (예: "등나무와 금붕어" 같은 제목 그대로 포함)
+    meta_targets: List[str] = []
+    for s in [
+        title,
+        klass,
+        desc.get("Subject_kor"),
+        desc.get("Subject_eng"),
+        desc.get("Keyword_kor"),
+        desc.get("Keyword_eng"),
+    ]:
+        if s:
+            meta_targets.append(str(s))
+
+    # CLIP 라벨 + 메타데이터 단어 합치고, 중복 제거
+    allowed_targets_list = list(dict.fromkeys((visual_labels or []) + meta_targets))
+    labels_str = (
+        ", ".join(allowed_targets_list) if allowed_targets_list else "특별히 추출된 단어 없음"
+    )
+
+    # immersive 모드에서는 RAG 텍스트는 쓰지 않으므로 비워 둠
+    _ = context_block
+
+    lines: List[str] = [
+        "당신은 한국어로 해설하는 미술관 도슨트입니다.",
+        "",
+        "[작품 기본 정보]",
+        f"제목: {title}",
+        f"작가: {artist}",
+        f"분류/장르: {klass}",
+        f"재질: {material}",
+        f"연도/시기: {year}",
+        "",
+        "[이 작품과 직접 관련된 단어 목록]",
+        # 예: '등나무와 금붕어, 새, 꽃, 물고기' 같이 제목 + CLIP 라벨 섞여서 들어감
+        labels_str,
+        "",
+        "위 목록에는 작품 제목·주제·이미지 분석을 통해 얻은 단어들만 들어 있습니다.",
+        "구체적인 사물 이름(예: 새, 꽃, 금붕어, 사람, 글씨 등)을 말할 때는 가급적 이 목록 안에 실제로 적힌 단어를 그대로 사용하십시오.",
+        "목록에 없는 전혀 다른 사물을 상상해서 새로 추가하지 마십시오. "
+        "예를 들어 목록에 없는데 갑자기 산, 건물, 도시 풍경, 바다, 들판, 도로 같은 배경을 만들어내면 안 됩니다.",
+        "",
+        "지침:",
+        "1. 전체 7~9문장 정도의 자연스러운 한국어 문장으로만 작성합니다.",
+        "2. 첫 문장은 작품 전체를 편안하게 감상하도록 안내하는 문장으로, 방향 단어(화면 왼쪽/오른쪽/가운데)를 쓰지 마십시오.",
+        "3. 이후 문장들에서는 다음 세 방향 표현만 사용합니다: '화면 왼쪽', '화면 가운데', '화면 오른쪽'.",
+        "4. '화면 왼쪽', '화면 가운데', '화면 오른쪽'이 등장하는 문장에서는, 반드시 위 단어 목록 안에 있는 대상 하나 이상을 함께 언급하십시오.",
+        "   예: '화면 가운데에는 금붕어가 헤엄치고 있습니다.' 처럼, 실제 목록 안의 단어를 써야 합니다.",
+        "5. 방향 표현이 없는 문장에서는 작품의 전체적인 분위기, 여백, 색감, 감정을 정리해도 좋습니다.",
+        "6. 마지막 문장은 작품 전체의 분위기와 감정을 정리하며, 관람자에게 여운을 남기는 문장으로 작성합니다.",
+        "7. 출력에는 번호, 불릿, 큰따옴표 없이 문장들만 줄바꿈으로 구분하여 제시하십시오.",
+    ]
+
+    # 시각적 대상에 따라 추가 규칙(선택)
+    if any("새" in t for t in allowed_targets_list):
+        lines.append(
+            "8. 목록에 '새'가 있다면, 적어도 한 문장에서는 새의 위치나 모습(예: 가지에 앉아 있는 새 두 마리)을 구체적으로 설명하십시오."
+        )
+    if any("물고기" in t or "금붕어" in t for t in allowed_targets_list):
+        lines.append(
+            "9. 목록에 '물고기'나 '금붕어'가 있다면, 적어도 한 문장에서는 물고기의 색감이나 움직임을 구체적으로 설명하십시오."
+        )
+    if any("사람" in t for t in allowed_targets_list):
+        lines.append(
+            "10. 목록에 '사람'이 있다면, 인물의 자세나 표정을 한 문장 이상에서 설명하십시오."
+        )
+
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────
+# 랜덤 ID 유틸
+# ─────────────────────────────────────────────────
+def list_ids_for_category(category: str = "painting_json") -> List[str]:
+    real_cat = map_category(category)
+    target_dir = JSON_ROOT / real_cat
+    if not target_dir.exists() or not target_dir.is_dir():
+        return []
+    ids: List[str] = [p.stem for p in target_dir.glob("*.json")]
+    return ids
+
+
+def pick_random_id(category: str = "painting_json") -> Optional[str]:
+    ids = list_ids_for_category(category)
+    if not ids:
+        return None
+    return random.choice(ids)
+
+
+# ─────────────────────────────────────────────────
+# 라우트
+# ─────────────────────────────────────────────────
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "model": MODEL_NAME,
+        "embed_model": EMBED_MODEL,
+        "has_api_key": bool(API_KEY),
+        "retriever_enabled": bool(use_retriever),
+    }
+
+
+@app.get("/json_list/{category}")
+def json_list(category: str):
+    real_cat = map_category(category)
+    target_dir = JSON_ROOT / real_cat
+    if not target_dir.exists() or not target_dir.is_dir():
+        raise HTTPException(status_code=404, detail=f"category not found: {real_cat}")
+    files = [p.name for p in target_dir.glob("*.json")]
+    return files
+
+
+@app.get("/find_image/{prefix}")
+def find_image(prefix: str):
+    """
+    prefix(예: kart_2d000645-C-8-81-1)에 해당하는 이미지를
+    미리 만들어 둔 인덱스에서 빠르게 찾는다.
+    """
+    index = build_image_index()
+
+    rel = index.get(prefix)
+    if rel:
+        return {"url": f"/image_extracted/{rel}"}
+
+    for k, v in index.items():
+        if k.startswith(prefix):
+            return {"url": f"/image_extracted/{v}"}
+
+    raise HTTPException(
+        status_code=404,
+        detail=f"image not found for prefix={prefix}",
     )
 
 
-if __name__ == "__main__":
-    app.run(debug=True)
+@app.post("/curate")
+async def curate(req: CurateIn):
+    if not API_KEY:
+        raise HTTPException(status_code=500, detail="Server missing GOOGLE_API_KEY")
+
+    card = req.card or {}
+    # 카드가 비어 있으면 id로 다시 로드
+    if not card and req.id:
+        card = load_card_by_id(None, req.id)
+
+    query = build_query(card)
+    hits = retrieve_context(query, k=5)
+    context_block = format_context(hits)
+    prompt = build_prompt(card, context_block)
+
+    try:
+        resp = model.generate_content(prompt)
+        text = (resp.text or "").strip()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
+
+    return {
+        "curator_text": text,
+        "retrieved": [
+            {"meta": h.get("meta"), "score": h.get("score"), "id": h.get("id")}
+            for h in hits
+        ],
+    }
+
+
+# -----------------------------
+#  immersive 해설 생성 (Fail to fetch 문제 해결 버전)
+# -----------------------------
+from google.api_core.exceptions import GoogleAPICallError, RetryError
+import asyncio
+
+@app.post("/curate/immersive")
+async def curate_immersive(req: CurateImmersiveIn):
+    if not API_KEY:
+        raise HTTPException(status_code=500, detail="Server missing GOOGLE_API_KEY")
+
+    # 카드 로드
+    card = req.card or {}
+    if not card and req.id:
+        try:
+            card = load_card_by_id(req.category, req.id)
+        except Exception as e:
+            raise HTTPException(status_code=404, detail=f"card load failed: {e}")
+
+    if not card:
+        raise HTTPException(status_code=400, detail="no card data for immersive curate")
+
+    # 이미지 라벨링
+    img_path = None
+    if req.id:
+        img_path = find_image_path_for_prefix(req.id)
+
+    visual_labels = []
+    if img_path:
+        try:
+            visual_labels = analyze_image_labels(img_path)
+        except Exception as e:
+            print("[WARN] CLIP failed:", e)
+
+    # 프롬프트 생성
+    prompt = build_immersive_prompt(card, "", visual_labels)
+
+    # -----------------------------
+    # Gemini 호출에 Timeout + 예외처리 추가 (Fail to fetch 원인 제거)
+    # -----------------------------
+    async def _call_gemini():
+        return model.generate_content(prompt)
+
+    try:
+        # ⬅ 여기 timeout=20 으로 설정해서 20초 넘으면 강제 종료 (Fail to fetch 방지)
+        resp = await asyncio.wait_for(_call_gemini(), timeout=20.0)
+        text = (resp.text or "").strip()
+
+    except asyncio.TimeoutError:
+        print("❌ [TIMEOUT] Gemini 응답 없음 → fallback 문장 사용")
+        text = "이 작품은 화면 전반에 조화로운 분위기를 담고 있습니다. 시선을 천천히 움직이며 감상해 보세요."
+
+    except (GoogleAPICallError, RetryError) as e:
+        print("❌ Gemini API 오류:", e)
+        text = "현재 AI 해설을 생성할 수 없습니다. 잠시 후 다시 시도해 주세요."
+
+    except Exception as e:
+        print("❌ 기타 오류:", e)
+        raise HTTPException(status_code=500, detail=f"immersive failed: {e}")
+
+    return {"curator_text": text, "labels": visual_labels}
+
+
+@app.get("/search")
+def search(q: str, k: int = 5):
+    if not use_retriever:
+        return {"results": [], "note": "retriever disabled"}
+    hits = retrieve_context(q, k=k)
+    return {
+        "results": [
+            {
+                "title": (h.get("meta") or {}).get("title"),
+                "artist": (h.get("meta") or {}).get("artist"),
+                "class": (h.get("meta") or {}).get("class"),
+                "material": (h.get("meta") or {}).get("material"),
+                "year": (h.get("meta") or {}).get("year"),
+                "score": h.get("score"),
+                "id": h.get("id"),
+            }
+            for h in hits
+        ]
+    }
+    
+# ───────────────────────────────────────────────────────────
+# Google Cloud TTS 엔드포인트
+# 프론트에서 /ai/tts 로 POST 하면 base64 mp3 를 돌려준다.
+# ───────────────────────────────────────────────────────────
+@app.post("/ai/tts")
+async def ai_tts(req: TtsIn):
+    """
+    Google Cloud Text-to-Speech 를 이용해서
+    req.text 를 mp3 로 합성하고 base64 문자열로 반환.
+    """
+    text = (req.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="TTS text is empty")
+
+    # 기본값 세팅
+    language_code = req.language_code or "ko-KR"
+    speaking_rate = req.speaking_rate or 1.0
+
+    try:
+        # GOOGLE_APPLICATION_CREDENTIALS 환경변수에 지정된
+        # 서비스 계정 키(gcp-tts.json)를 자동으로 사용한다.
+        client = texttospeech.TextToSpeechClient()
+
+        synthesis_input = texttospeech.SynthesisInput(text=text)
+
+        # voice_name 이 오면 그 이름을 그대로 사용 (예: "ko-KR-Wavenet-A")
+        # 안 오면 language_code + NEUTRAL 로 기본 생성
+        if req.voice_name:
+            voice = texttospeech.VoiceSelectionParams(
+                language_code=language_code,
+                name=req.voice_name,
+            )
+        else:
+            voice = texttospeech.VoiceSelectionParams(
+                language_code=language_code,
+                ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL,
+            )
+
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.MP3,
+            speaking_rate=speaking_rate,
+        )
+
+        response = client.synthesize_speech(
+            input=synthesis_input,
+            voice=voice,
+            audio_config=audio_config,
+        )
+
+        # 바이너리를 base64 문자열로 인코딩
+        audio_b64 = base64.b64encode(response.audio_content).decode("utf-8")
+
+        return {"audio_b64": audio_b64}
+
+    except Exception as e:
+        print("[ERROR] TTS 실패:", e)
+        raise HTTPException(
+            status_code=500,
+            detail=f"TTS generation failed: {e}",
+        )
+
+
+@app.get("/search_image")
+def search_image(q: str, k: int = 5):
+    if not use_image_retriever:
+        return {"results": [], "note": "image retriever disabled"}
+    hits = retrieve_image_context(q, k=k)
+    return {
+        "results": [
+            {
+                "id": h.get("id"),
+                "title": (h.get("meta") or {}).get("title"),
+                "artist": (h.get("meta") or {}).get("artist"),
+                "class": (h.get("meta") or {}).get("class"),
+                "year": (h.get("meta") or {}).get("year"),
+                "image_path": (h.get("meta") or {}).get("image_path"),
+                "score": h.get("score"),
+            }
+            for h in hits
+        ]
+    }
+
+
+# ─────────────────────────────────────────────────
+# 간단한 에이전트 엔드포인트 (Welcome 화면에서 사용)
+# ─────────────────────────────────────────────────
+@app.post("/ai/agent")
+async def ai_agent(req: AgentIn):
+    """
+    아주 간단한 rule 기반:
+    - '비교', '두 작품' 등이 들어있으면 compare 모드
+    - '읽어줘', '들려줘', '음성' 등이 있으면 tts 모드
+    - 그 외에는 curate 모드 (단일 작품 추천)
+    """
+    q = req.query.strip()
+    category = req.category or "painting_json"
+
+    if not q:
+        q = "오늘 볼 만한 작품을 추천해줘"
+
+    lower_q = q.lower()
+    action = "curate"
+    if "비교" in q or "두 작품" in q or "둘 다" in q:
+        action = "compare"
+    elif "읽어줘" in q or "들려줘" in q or "음성" in q:
+        action = "tts"
+
+    # 추천 id 하나 뽑기 (retrieval이 있으면 거기서, 없으면 랜덤)
+    primary_id = None
+    secondary_id = None
+
+    if use_retriever and retrieval:
+        hits = retrieve_context(q, k=3)
+        if hits:
+            primary_id = hits[0]["id"]
+            if action == "compare" and len(hits) > 1:
+                secondary_id = hits[1]["id"]
+
+    if not primary_id:
+        primary_id = pick_random_id(category)
+    if action == "compare" and not secondary_id:
+        secondary_id = pick_random_id(category)
+
+    return {
+        "action": action,
+        "primary_id": primary_id,
+        "secondary_id": secondary_id,
+        "category": category,
+    }
+
+
+# ─────────────────────────────────────────────────
+# 비교 해설 (Compare 페이지에서 사용)
+# ─────────────────────────────────────────────────
+@app.post("/ai/analyze-compare")
+async def ai_analyze_compare(req: CompareIn):
+    if not API_KEY:
+        raise HTTPException(status_code=500, detail="Server missing GOOGLE_API_KEY")
+
+    if len(req.ids) < 2:
+        raise HTTPException(status_code=400, detail="at least 2 ids required")
+
+    cards: List[Dict] = []
+    for i in req.ids[:2]:
+        cards.append(load_card_by_id(req.category, i))
+
+    def card_brief(c: Dict) -> str:
+        desc = c.get("Description") or {}
+        photo = c.get("Photo_Info") or {}
+        data_info = c.get("Data_Info") or {}
+        title = (
+            c.get("title")
+            or desc.get("ArtTitle_kor")
+            or desc.get("ArtTitle_eng")
+            or data_info.get("ImageFileName")
+            or c.get("id", "")
+        )
+        artist = (
+            c.get("artist")
+            or desc.get("ArtistName_kor")
+            or desc.get("ArtistName_eng")
+            or ""
+        )
+        klass = (
+            c.get("class")
+            or desc.get("Class_kor")
+            or desc.get("Class_eng")
+            or ""
+        )
+        year = c.get("date_or_period") or photo.get("PhotoDate") or ""
+        material = (
+            c.get("material")
+            or desc.get("Material_kor")
+            or desc.get("Material_eng")
+            or ""
+        )
+        return f"- 제목: {title}, 작가: {artist}, 분류/장르: {klass}, 재질: {material}, 연도/시기: {year}"
+
+    prompt = "\n".join(
+        [
+            "당신은 미술관 도슨트입니다.",
+            "아래 두 작품의 공통점과 차이점을 비교해서 설명해 주세요.",
+            "전문 용어를 남발하지 말고, 관람객이 이해하기 쉬운 한국어 구어체로 작성하세요.",
+            "",
+            "[작품 A]",
+            card_brief(cards[0]),
+            "",
+            "[작품 B]",
+            card_brief(cards[1]),
+            "",
+            "1~2문장으로 두 작품의 공통된 분위기·주제를 설명하고,",
+            "이어지는 4~5문장에서 구체적인 차이점(구도, 색감, 인물/대상, 감정 표현 등)을 정리해 주세요.",
+            "불릿/번호/제목 없이 자연스러운 단락 텍스트만 출력하세요.",
+        ]
+    )
+
+    try:
+        resp = model.generate_content(prompt)
+        text = (resp.text or "").strip()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Compare generation failed: {e}")
+
+    return {"compare_text": text}
