@@ -11,13 +11,12 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from google.cloud import texttospeech
 import base64  # audio를 base64로 전달할 거라서
-from pydantic import BaseModel
 
 # 🆕 CLIP / torch
 import torch
 import open_clip  # pip install open_clip_torch
 
-# 🆕 chromadb 타입은 아래에서 이미 쓰고 있어서 여기서 import 해도 됨
+# 🆕 chromadb
 import chromadb
 from chromadb import Settings
 from chromadb.utils.embedding_functions import EmbeddingFunction
@@ -45,6 +44,19 @@ JSON_ROOT = DATA_ROOT / "json_extracted"
 IMG_ROOT  = DATA_ROOT / "image_extracted"
 
 # ───────────────────────────────────────────────────────────
+# 이미지 인덱스 로드 (prefix -> 상대경로)
+# ───────────────────────────────────────────────────────────
+IMAGE_INDEX_PATH = DATA_ROOT / "image_index.json"
+
+try:
+    with IMAGE_INDEX_PATH.open("r", encoding="utf-8") as f:
+        IMAGE_INDEX = json.load(f)
+    print(f"[IMAGE_INDEX] loaded {len(IMAGE_INDEX)} items from {IMAGE_INDEX_PATH}")
+except FileNotFoundError:
+    IMAGE_INDEX = {}
+    print(f"[IMAGE_INDEX] NOT FOUND: {IMAGE_INDEX_PATH}, using empty index")
+
+# ───────────────────────────────────────────────────────────
 # 카테고리 별명 → 실제 폴더명 매핑
 # ───────────────────────────────────────────────────────────
 CATEGORY_MAP: Dict[str, str] = {
@@ -57,7 +69,6 @@ def map_category(cat: Optional[str]) -> Optional[str]:
     if not cat:
         return None
     return CATEGORY_MAP.get(cat, cat)
-
 
 # ───────────────────────────────────────────────────────────
 # Chroma(벡터DB) + Gemini 텍스트 RAG 컬렉션
@@ -78,25 +89,29 @@ class GeminiEF(EmbeddingFunction):
             out.append(r["embedding"])
         return out
 
-# ✅ chroma 클라이언트 & 컬렉션 설정
+# ✅ chroma 클라이언트 & 컬렉션 설정 (텍스트 / 이미지 분리)
 try:
-    CHROMA_PATH = r"C:\Exhibit\chroma_db"
-
-    client = chromadb.PersistentClient(
-        path=CHROMA_PATH,
+    # 텍스트 임베딩 DB
+    TEXT_CHROMA_PATH = r"C:\Exhibit\curator_server\backend\chroma_db_text"
+    text_client = chromadb.PersistentClient(
+        path=TEXT_CHROMA_PATH,
         settings=Settings(anonymized_telemetry=False),
     )
 
-    # 1) 텍스트 RAG용 컬렉션 (이미 build_index.py로 채워둔 것)
-    retrieval = client.get_or_create_collection(
+    retrieval = text_client.get_or_create_collection(
         name="curator_corpus",
-        embedding_function=GeminiEF(),
+        embedding_function=GeminiEF(),          # 텍스트는 GeminiEF로 쿼리
         metadata={"hnsw:space": "cosine"},
     )
 
-    # 2) 이미지 RAG용 컬렉션 (build_image_index_clip.py로 채워둔 것)
-    #    → 여기에는 embedding_function 없음 (우리가 직접 CLIP 임베딩 넣고, 쿼리할 때도 직접 벡터 넣음)
-    image_collection = client.get_or_create_collection(
+    # 이미지 임베딩 DB
+    IMAGE_CHROMA_PATH = r"C:\Exhibit\chroma_db"
+    image_client = chromadb.PersistentClient(
+        path=IMAGE_CHROMA_PATH,
+        settings=Settings(anonymized_telemetry=False),
+    )
+
+    image_collection = image_client.get_or_create_collection(
         name="curator_image_clip",
         metadata={"hnsw:space": "cosine"},
     )
@@ -140,7 +155,6 @@ try:
 except Exception as e:
     print("[WARN] CLIP 초기화 실패:", e)
     use_image_retriever = False
-
 
 # ───────────────────────────────────────────────────────────
 # FastAPI 앱
@@ -246,10 +260,246 @@ def load_card_by_id(category: Optional[str], art_id: str) -> Dict:
     )
 
 # ───────────────────────────────────────────────────────────
+# 제목/작가 기반 검색 유틸
+# ───────────────────────────────────────────────────────────
+def extract_title_from_query(q: str) -> Optional[str]:
+    """
+    '의기라는 작품 보여줘', '의기라는 작품 들려줘' 같이
+    '~라는 작품 ...' 패턴에서 제목 부분만 뽑아낸다.
+    """
+    if not q:
+        return None
+    q = q.strip()
+
+    # 1) 가장 확실한 패턴: '라는 작품'
+    if "라는 작품" in q:
+        before = q.split("라는 작품")[0].strip()
+        return before or None
+
+    # 2) '작품 보여줘', '작품 들려줘'만 있는 경우까지 커버
+    for key in ["작품 보여줘", "작품 들려줘"]:
+        if key in q:
+            before = q.split(key)[0].strip()
+            # 조사 정리
+            for josa in ["를", "을", "은", "는", "이", "가"]:
+                if before.endswith(josa):
+                    before = before[:-1]
+            return before or None
+
+    return None
+
+def find_cards_by_title_keyword(
+    keyword: str,
+    category: Optional[str] = "painting_json",
+    max_results: int = 3,
+) -> List[Dict]:
+    """
+    json_extracted/{category} 아래에서
+    제목(한/영) 안에 keyword가 포함된 작품들을 찾는다.
+    """
+    keyword = (keyword or "").strip()
+    if not keyword:
+        return []
+
+    real_cat = map_category(category or "painting_json")
+    target_dir = JSON_ROOT / real_cat
+    if not target_dir.exists() or not target_dir.is_dir():
+        return []
+
+    matches: List[Dict] = []
+
+    for p in target_dir.glob("*.json"):
+        try:
+            with p.open("r", encoding="utf-8") as f:
+                card = json.load(f)
+        except Exception:
+            continue
+
+        desc = card.get("Description") or {}
+
+        # 제목 후보 필드들
+        title_candidates = [
+            card.get("title"),
+            card.get("title_kor"),
+            card.get("title_ko"),
+            card.get("title_eng"),
+            desc.get("ArtTitle_kor"),
+            desc.get("ArtTitle_eng"),
+        ]
+
+        hit = False
+        for t in title_candidates:
+            if t and keyword in str(t):
+                hit = True
+                break
+
+        if not hit:
+            continue
+
+        matches.append(
+            {
+                "id": p.stem,
+                "title": next((t for t in title_candidates if t), ""),
+            }
+        )
+
+        if len(matches) >= max_results:
+            break
+
+    return matches
+
+def extract_artist_from_query(q: str) -> Optional[str]:
+    """
+    '김환기 작가의 작품 보여줘', '박수근 작가 작품 들려줘'
+    같은 문장에서 '작가' 앞에 있는 이름만 뽑기.
+    """
+    if not q:
+        return None
+    q = q.strip()
+
+    # 1) '작가의 작품' 패턴
+    if "작가의 작품" in q:
+        before = q.split("작가의 작품")[0].strip()
+    # 2) '작가 작품' 패턴
+    elif "작가 작품" in q:
+        before = q.split("작가 작품")[0].strip()
+    # 3) '작가의' 만 있는 경우
+    elif "작가의" in q:
+        before = q.split("작가의")[0].strip()
+    # 4) 그냥 '작가'만 있는 경우 (예: "김환기 작가 그림 들려줘")
+    elif "작가" in q:
+        before = q.split("작가")[0].strip()
+    else:
+        return None
+
+    # 조사/공백 정리
+    for josa in ["를", "을", "은", "는", "이", "가", "의"]:
+        if before.endswith(josa):
+            before = before[:-1]
+    before = before.strip()
+
+    return before or None
+
+def find_cards_by_artist_keyword(
+    keyword: str,
+    category: Optional[str] = "painting_json",
+    max_results: int = 5,
+) -> List[Dict]:
+    """
+    json_extracted/{category} 아래에서
+    작가명(한/영) 안에 keyword가 포함된 작품들을 찾는다.
+    """
+    keyword = (keyword or "").strip()
+    if not keyword:
+        return []
+
+    real_cat = map_category(category or "painting_json")
+    target_dir = JSON_ROOT / real_cat
+    if not target_dir.exists() or not target_dir.is_dir():
+        return []
+
+    matches: List[Dict] = []
+
+    for p in target_dir.glob("*.json"):
+        try:
+            with p.open("r", encoding="utf-8") as f:
+                card = json.load(f)
+        except Exception:
+            continue
+
+        desc = card.get("Description") or {}
+
+        # 작가 후보 필드들
+        artist_candidates = [
+            card.get("artist"),
+            card.get("artist_kor"),
+            card.get("artist_ko"),
+            card.get("artist_eng"),
+            desc.get("ArtistName_kor"),
+            desc.get("ArtistName_eng"),
+        ]
+
+        hit = False
+        for a in artist_candidates:
+            if a and keyword in str(a):
+                hit = True
+                break
+
+        if not hit:
+            continue
+
+        matches.append(
+            {
+                "id": p.stem,
+                "artist": next((a for a in artist_candidates if a), ""),
+            }
+        )
+
+        if len(matches) >= max_results:
+            break
+
+    return matches
+
+
+def extract_subject_from_painting_query(q: str) -> Optional[str]:
+    """
+    '참새가 그려진 작품 보여줘', '사람이 그려진 그림 보고싶어'
+    같은 문장에서 '참새', '사람' 같은 '대상'만 뽑기.
+    """
+    if not q:
+        return None
+    q = q.strip()
+
+    # 자주 나오는 패턴들
+    patterns = [
+        "가 그려진", "이 그려진",
+        "가 나오는", "이 나오는",
+        "가 있는",   "이 있는",
+        "이 등장하는", "가 등장하는",
+    ]
+
+    for pat in patterns:
+        if pat in q:
+            before = q.split(pat)[0].strip()
+            # 혹시 끝에 조사 한 번 더 붙어 있으면 제거
+            for josa in ["를", "을", "은", "는", "이", "가", "의"]:
+                if before.endswith(josa):
+                    before = before[:-1]
+            before = before.strip()
+            return before or None
+
+    # 패턴에 안 걸리지만, 대충 '~가 그려진 작품' 형태일 수 있는 경우에 대한 아주 러프한 보정
+    # 예: "참새 그림 보여줘", "사람 그림 보여줘"
+    if "그림" in q or "작품" in q or "사진" in q:
+        # '그림', '작품', '사진' 앞 단어 하나만 대충 추출
+        for key in ["그림", "작품", "사진"]:
+            if key in q:
+                before = q.split(key)[0].strip()
+                # 공백 기준 마지막 토큰만 사용
+                tokens = before.split()
+                if tokens:
+                    cand = tokens[-1]
+                    for josa in ["를", "을", "은", "는", "이", "가", "의"]:
+                        if cand.endswith(josa):
+                            cand = cand[:-1]
+                    cand = cand.strip()
+                    return cand or None
+
+    return None
+
+
+# ───────────────────────────────────────────────────────────
 # RAG 유틸
 # ───────────────────────────────────────────────────────────
 def build_query(card: Dict) -> str:
-    """카드의 핵심 필드로 의미검색용 질의문을 조립"""
+    """카드의 핵심 필드 + AiCaption으로 의미검색용 질의문을 조립"""
+    caption = (
+        card.get("vision_caption_ko")
+        or card.get("vision_caption")
+        or card.get("vision_caption_en")
+        or ""
+    )
+
     parts: List[Optional[str]] = [
         card.get("title") or card.get("title_ko") or card.get("title_en"),
         card.get("artist") or card.get("artist_ko") or card.get("artist_en"),
@@ -257,6 +507,7 @@ def build_query(card: Dict) -> str:
         " ".join(card.get("categories", []) or []),
         card.get("material") or card.get("material_ko") or card.get("material_en"),
         card.get("date_or_period") or card.get("photo_date"),
+        caption,  # 👈 여기!
     ]
     return " ".join([p for p in parts if p])
 
@@ -306,6 +557,46 @@ def format_context(hits: List[Dict]) -> str:
         lines.append("")
     return "\n".join(lines)
 
+def to_clip_query(q: str) -> str:
+    """
+    한국어(또는 자연어) 검색 문장을
+    CLIP이 이해하기 좋은 짧은 영어 시각 묘사로 바꿔준다.
+    예) '참새가 그려진 작품 보여줘' -> 'a painting of a sparrow'
+    """
+    q = (q or "").strip()
+    if not q:
+        return q
+
+    # 이미 영어가 섞인 경우는 그대로 써도 무방하지만,
+    # 여기서는 일단 LLM 번역 한 번 태우는 방식으로 단순화.
+    prompt = (
+        "You are a helper that converts Korean art search queries "
+        "into short English visual descriptions suitable for CLIP text encoder.\n"
+        "Examples:\n"
+        "1) '참새가 그려진 작품 보여줘' -> 'a painting of a sparrow'\n"
+        "2) '바닷가 풍경 그림 보여줘' -> 'a painting of a seaside landscape'\n"
+        "3) '밤하늘에 별이 많은 그림' -> 'a painting of a starry night sky'\n"
+        "Only output the final English phrase, no quotes, no extra text.\n\n"
+        f"Query: {q}\n"
+        "English visual description:"
+    )
+
+    try:
+        resp = model.generate_content(prompt)
+        text = (resp.text or "").strip()
+        # 혹시 이상하게 나오면 원문 fallback
+        if not text:
+            return q
+        # 너무 길면 CLIP에 안 좋으니 30~40단어 정도까지만 잘라줌 (옵션)
+        words = text.split()
+        if len(words) > 40:
+            text = " ".join(words[:40])
+        return text
+    except Exception as e:
+        print("[to_clip_query] translation failed, fallback to original:", e)
+        return q
+
+
 def retrieve_image_context(query: str, k: int = 5) -> List[Dict]:
     """
     CLIP 텍스트 임베딩으로 curator_image_clip에서
@@ -315,8 +606,13 @@ def retrieve_image_context(query: str, k: int = 5) -> List[Dict]:
     if not use_image_retriever or not image_collection or not query:
         return []
 
+    # 🔥 1단계: 한국어 쿼리를 CLIP용 짧은 영어 묘사로 변환
+    clip_query = to_clip_query(query)
+    print(f"[retrieve_image_context] raw query='{query}' -> clip_query='{clip_query}'")
+
     try:
-        vec = embed_clip_text([query])[0]  # 1개 쿼리 → 1벡터
+        # 🔥 한글 대신 변환된 영어 텍스트로 CLIP 임베딩 생성
+        vec = embed_clip_text([clip_query])[0]  # 1개 쿼리 → 1벡터
     except Exception as e:
         print("[WARN] CLIP embed 실패:", e)
         return []
@@ -350,6 +646,7 @@ def retrieve_image_context(query: str, k: int = 5) -> List[Dict]:
         )
     return hits
 
+
 def _to_image_url(raw_path: Optional[str]) -> Optional[str]:
     """
     chroma 메타에 저장된 로컬 경로(D:\\Exhibit\\image_extracted\\...)를
@@ -369,7 +666,6 @@ def _to_image_url(raw_path: Optional[str]) -> Optional[str]:
         if s.startswith("/image_extracted/"):
             return s
         return None
-
 
 # ─────────────────────────────────────────────
 # CLIP 기반 유사 이미지 검색 (에러 나도 500 안 던지게)
@@ -479,20 +775,15 @@ def similar_images_by_id(
             if m_cat is not None and m_cat != category:
                 continue
 
-                # 🔥 로컬 경로 → URL 변환
+        # 🔥 로컬 경로 → URL 변환
         raw_img_path = meta.get("image_path")
         img_url = _to_image_url(raw_img_path)
 
-        # 🔁 메타에 경로가 없거나 변환 실패하면, id로 직접 이미지 검색 (백업)
+        # 🔁 메타에 경로가 없거나 변환 실패하면, id(prefix)로 인덱스에서 찾기 (백업)
         if not img_url:
-            exts = ["jpg", "jpeg", "png", "JPG", "JPEG", "PNG"]
-            for ext in exts:
-                pattern = f"{cid}*.{ext}"
-                matches = list(IMG_ROOT.rglob(pattern))
-                if matches:
-                    rel = matches[0].relative_to(IMG_ROOT)
-                    img_url = f"/image_extracted/{rel.as_posix()}"
-                    break
+            rel = IMAGE_INDEX.get(cid)
+            if rel:
+                img_url = f"/image_extracted/{rel}"
 
         items.append(
             {
@@ -508,14 +799,10 @@ def similar_images_by_id(
             }
         )
 
-
         if len(items) >= k:
             break
 
-
     return items
-
-
 
 # ───────────────────────────────────────────────────────────
 # 프롬프트 빌더
@@ -615,7 +902,6 @@ def pick_random_id(category: str = "painting_json") -> Optional[str]:
         return None
     return random.choice(ids)
 
-
 def filter_candidates_by_category(cands, category):
     """
     에이전트 후보 중에서,
@@ -670,19 +956,16 @@ def json_list(category: str):
 @app.get("/find_image/{prefix}")
 def find_image(prefix: str):
     """
-    image_extracted 아래에서 {prefix}로 시작하는 이미지 파일을 찾고,
-    가장 먼저 찾은 1개의 URL을 반환.
+    image_index.json에서 prefix에 해당하는 상대 경로를 찾아
+    /image_extracted/... 형태의 URL로 반환.
     """
-    exts = ["jpg", "jpeg", "png", "JPG", "JPEG", "PNG"]
-    for ext in exts:
-        pattern = f"{prefix}*.{ext}"
-        matches = list(IMG_ROOT.rglob(pattern))
-        if matches:
-            rel = matches[0].relative_to(IMG_ROOT)
-            url = f"/image_extracted/{rel.as_posix()}"
-            return {"url": url}
+    rel = IMAGE_INDEX.get(prefix)
+    if not rel:
+        raise HTTPException(status_code=404,
+                            detail=f"image not found for prefix={prefix}")
 
-    raise HTTPException(status_code=404, detail=f"image not found for prefix={prefix}")
+    url = f"/image_extracted/{rel}"
+    return {"url": url}
 
 @app.post("/curate")
 async def curate(req: CurateIn):
@@ -749,18 +1032,13 @@ def search_image(q: str, k: int = 5):
         raw_img = meta.get("image_path")
         img_url = _to_image_url(raw_img)
 
-        # 그래도 없으면 id로 직접 찾기 (백업)
+        # 그래도 없으면 id(prefix)로 인덱스에서 찾기 (백업)
         if not img_url:
             cid = h.get("id")
             if cid:
-                exts = ["jpg", "jpeg", "png", "JPG", "JPEG", "PNG"]
-                for ext in exts:
-                    pattern = f"{cid}*.{ext}"
-                    matches = list(IMG_ROOT.rglob(pattern))
-                    if matches:
-                        rel = matches[0].relative_to(IMG_ROOT)
-                        img_url = f"/image_extracted/{rel.as_posix()}"
-                        break
+                rel = IMAGE_INDEX.get(cid)
+                if rel:
+                    img_url = f"/image_extracted/{rel}"
 
         results.append(
             {
@@ -776,9 +1054,9 @@ def search_image(q: str, k: int = 5):
 
     return {"results": results}
 
-
-
-
+# ───────────────────────────────────────────────────────────
+# 에이전트 라우트
+# ───────────────────────────────────────────────────────────
 @app.post("/ai/agent")
 async def agent_route(req: AgentIn):
     if not API_KEY:
@@ -791,12 +1069,65 @@ async def agent_route(req: AgentIn):
     # 0) 키워드 먼저 판별
     lower_q = q.lower()
     compare_keywords = ["비교", "두 작품", "두 점", "2점", "vs", "차이"]
-    tts_keywords = ["읽어줘", "읽어 줘", "설명 들어보고 싶어", "음성", "tts", "음성으로","들려줘", "들려 줘"]
+    tts_keywords = ["읽어줘", "읽어 줘", "설명 들어보고 싶어", "음성", "tts", "음성으로", "들려줘", "들려 줘"]
 
     is_compare = any(kw in lower_q for kw in compare_keywords)
     is_tts = any(kw in lower_q for kw in tts_keywords)
 
     fallback_cat = req.category or "painting_json"
+
+    # 🔥 0-A) 쿼리에서 '제목 후보' / '작가 후보' 추출
+    title_kw = extract_title_from_query(q)
+    artist_kw = extract_artist_from_query(q)
+
+    # 🔥 0-B) 제목 후보가 있으면, JSON에서 직접 제목 검색
+    direct_title_matches: List[Dict] = []
+    if title_kw:
+        direct_title_matches = find_cards_by_title_keyword(
+            keyword=title_kw,
+            category=fallback_cat,
+            max_results=3,
+        )
+        if direct_title_matches:
+            print("[agent_route] direct title match:", title_kw,
+                  "->", [m["id"] for m in direct_title_matches])
+
+    # 🔥 0-C) 작가 후보가 있으면, JSON에서 직접 작가 검색
+    direct_artist_matches: List[Dict] = []
+    if artist_kw:
+        direct_artist_matches = find_cards_by_artist_keyword(
+            keyword=artist_kw,
+            category=fallback_cat,
+            max_results=5,
+        )
+        if direct_artist_matches:
+            print("[agent_route] direct artist match:", artist_kw,
+                  "->", [m["id"] for m in direct_artist_matches])
+
+    # 🔥 0-D) 비교/음성 요청이 아니고, 제목 직접 매치가 있으면 → 바로 curate
+    if direct_title_matches and not is_compare and not is_tts:
+        primary_id = direct_title_matches[0]["id"]
+        return {
+            "action": "curate",
+            "primary_id": primary_id,
+            "secondary_id": None,
+            "category": fallback_cat,
+            "reason": f"'{title_kw}'라는 작품 제목과 일치하는 작품을 직접 찾아 추천했습니다.",
+            "candidates": direct_title_matches,
+        }
+
+    # 🔥 0-E) 비교/음성 요청이 아니고, 작가 직접 매치가 있으면
+    #         해당 작가의 작품들 중 하나를 골라서 보여줌
+    if direct_artist_matches and not is_compare and not is_tts:
+        primary_id = direct_artist_matches[0]["id"]
+        return {
+            "action": "curate",
+            "primary_id": primary_id,
+            "secondary_id": None,
+            "category": fallback_cat,
+            "reason": f"'{artist_kw}' 작가의 작품 중 하나를 직접 찾아 추천했습니다.",
+            "candidates": direct_artist_matches,
+        }
 
     # 1) 의미 검색 (후보 작품 리스트)
     #    - 텍스트 RAG(Gemini) + 이미지 RAG(CLIP) 둘 다에서 후보를 가져와 합침
@@ -850,8 +1181,6 @@ async def agent_route(req: AgentIn):
 
     print("[agent_route] candidates(after filter):", [c["id"] for c in candidates])
 
-
-
     # 2) '비교' 요청이면 → hits가 없어도 무조건 compare로
     if is_compare:
         selected_ids: List[str] = []
@@ -881,12 +1210,31 @@ async def agent_route(req: AgentIn):
             "candidates": candidates,
         }
 
-    # 3) TTS 요청이면 → 후보 1개 또는 랜덤 1개 선택
+    # 3) TTS 요청이면 → '제목/작가 직접 매치'를 최우선으로 사용
     if is_tts:
-        if candidates:
+        primary_id = None
+        tts_candidates: List[Dict] = []
+
+        # 3-1) 제목 직접 매치가 있으면 그걸 우선 사용
+        if direct_title_matches:
+            primary_id = direct_title_matches[0]["id"]
+            tts_candidates = direct_title_matches
+            reason = f"'{title_kw}'라는 작품 제목과 일치하는 작품을 찾아 음성 설명을 재생합니다."
+        # 3-2) 없으면, 작가 직접 매치가 있으면 사용
+        elif direct_artist_matches:
+            primary_id = direct_artist_matches[0]["id"]
+            tts_candidates = direct_artist_matches
+            reason = f"'{artist_kw}' 작가의 작품 중 하나를 선택해 음성 설명을 재생합니다."
+        # 3-3) 그것도 없으면, 일반 RAG 후보 사용
+        elif candidates:
             primary_id = candidates[0]["id"]
+            tts_candidates = candidates
+            reason = "의미검색 결과 중 가장 관련성이 높은 작품으로 음성 설명을 재생합니다."
+        # 3-4) 아무것도 없으면 랜덤
         else:
             primary_id = pick_random_id(fallback_cat)
+            tts_candidates = []
+            reason = "검색 결과가 없어 임의의 작품으로 음성 설명을 재생합니다."
 
         print("[agent_route] forced tts:", primary_id)
         return {
@@ -894,8 +1242,8 @@ async def agent_route(req: AgentIn):
             "primary_id": primary_id,
             "secondary_id": None,
             "category": fallback_cat,
-            "reason": "사용자가 음성 설명을 요청해서 해당 작품으로 TTS 모드를 선택했습니다.",
-            "candidates": candidates,
+            "reason": reason,
+            "candidates": tts_candidates,
         }
 
     # 4) 여기까지 왔는데 후보가 하나도 없으면 그냥 랜덤 curate
@@ -931,7 +1279,7 @@ async def agent_route(req: AgentIn):
         "규칙:",
         "- 반드시 아래 'candidate_artworks' 목록 안에 있는 id만 선택하세요.",
         "- 사용자가 '비교', '두 작품', 'vs', '차이' 등을 언급하면 action은 가급적 'compare'를 사용하세요.",
-        "- 사용자가 '읽어줘', '설명 들어보고 싶어', '음성', 'tts' 등을 언급하면 action은 'tts'를 사용하세요.",
+        "- 사용자가 '읽어줘', '설명 들어보고 싶어', '음성', 'tts', '들려줘' 등을 언급하면 action은 'tts'를 사용하세요.",
         "- 그 외의 경우는 기본값으로 'curate'를 사용하세요.",
         "- category는 특별히 언급이 없으면 null로 두어도 됩니다.",
         "",
@@ -1096,7 +1444,6 @@ async def analyze_compare(req: CompareIn):
         ],
     }
 
-
 # ───────────────────────────────────────────────────────────
 # Google Cloud TTS 엔드포인트
 # ───────────────────────────────────────────────────────────
@@ -1113,11 +1460,9 @@ async def tts_route(req: TtsIn):
     # 프론트에서 넘어온 값 정리
     language_code = (req.language_code or "ko-KR").strip()
 
-    
     voice_name = (req.voice_name or "").strip() or "ko-KR-Wavenet-A"
 
     # 백엔드에서는 기본 1.0으로 두고, 실제 배속은 브라우저 audio.playbackRate로 제어
-    # (그래도 혹시 몰라 넘겨줄 값이 있으면 사용)
     try:
         speaking_rate = float(req.speaking_rate or 1.0)
     except (TypeError, ValueError):
@@ -1136,7 +1481,7 @@ async def tts_route(req: TtsIn):
 
         voice_params = texttospeech.VoiceSelectionParams(
             language_code=language_code,
-            name=voice_name,  # 프론트에서 온 Wavenet 이름 그대로 사용
+            name=voice_name,
         )
 
         audio_config = texttospeech.AudioConfig(
@@ -1154,15 +1499,12 @@ async def tts_route(req: TtsIn):
         return {"audio_b64": audio_b64}
 
     except Exception as e:
-        # 디버깅 편하게 약간 로그 찍어도 좋음
         print("[/ai/tts] error:", e)
         raise HTTPException(status_code=500, detail=f"TTS 실패: {e}")
-    
-    
+
 # ───────────────────────────────────────────────────────────
 # 유사한 이미지 엔드포인트
 # ───────────────────────────────────────────────────────────    
-    
 @app.get("/similar_images")
 def similar_images(
     id: str,
@@ -1189,10 +1531,9 @@ def similar_images(
         # 항상 items 키로 리턴 (프론트 Detail.jsx와 맞추기)
         return {"items": items}
     except Exception as e:
-        # 여기서도 500 던지지 말고, 그냥 빈 items로 처리
         print(f"[/similar_images] error for id={id}: {e}")
         return {"items": []}
-    
+
 @app.get("/db_ids")
 def db_ids():
     if image_collection is None:
@@ -1207,21 +1548,3 @@ def db_ids():
         return {"ids": ids}
     except Exception as e:
         return {"error": str(e), "ids": []}
-    
-@app.get("/db_ids")
-def db_ids():
-    if image_collection is None:
-        return {"ids": [], "note": "image_collection is None"}
-
-    try:
-        res = image_collection.get()
-        ids = res.get("ids", [])
-        # numpy array 방어
-        if not isinstance(ids, list):
-            ids = list(ids)
-        return {"ids": ids}
-    except Exception as e:
-        return {"error": str(e), "ids": []}
-
-
-    
