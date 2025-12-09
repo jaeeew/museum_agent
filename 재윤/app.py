@@ -11,6 +11,8 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from google.cloud import texttospeech
 import base64  # audio를 base64로 전달할 거라서
+import asyncio
+import re
 
 # 🆕 CLIP / torch
 import torch
@@ -157,6 +159,26 @@ except Exception as e:
     use_image_retriever = False
 
 # ───────────────────────────────────────────────────────────
+# 캐시 (프로세스 메모리 기반)
+# ───────────────────────────────────────────────────────────
+# 같은 작품을 다시 열 때 Gemini를 다시 부르지 않도록 하는 캐시
+CURATION_CACHE: Dict[str, str] = {}          # id -> curator_text
+IMMERSIVE_CACHE: Dict[str, Dict] = {}        # id -> {"text": str, "labels": List[str]}
+
+# 같은 텍스트에 대해 TTS를 다시 호출하지 않도록 하는 캐시
+from hashlib import md5
+TTS_CACHE: Dict[str, str] = {}               # key -> audio_b64
+
+# 🔑 Immersive 캐시 키 헬퍼
+def make_immersive_key(card_id: Optional[str], category: Optional[str]) -> Optional[str]:
+    if not card_id:
+        return None
+    return f"{category or 'any'}::{card_id}"
+
+# 🆕 에이전트 캐시
+AGENT_CACHE: Dict[str, Dict] = {}    
+
+# ───────────────────────────────────────────────────────────
 # FastAPI 앱
 # ───────────────────────────────────────────────────────────
 app = FastAPI()
@@ -196,6 +218,11 @@ app.mount(
 class CurateIn(BaseModel):
     id: str
     card: Optional[Dict] = None  # py3.9 호환
+
+class CurateImmersiveIn(BaseModel):  # 👈 여기 추가
+    id: Optional[str] = None
+    category: Optional[str] = None
+    card: Optional[Dict] = None
 
 class CompareIn(BaseModel):
     """
@@ -287,6 +314,42 @@ def extract_title_from_query(q: str) -> Optional[str]:
             return before or None
 
     return None
+
+def extract_two_titles_from_query(q: str) -> List[str]:
+    """
+    '의기와 빨래터라는 작품 두 개 비교해줘',
+    '의기랑 빨래터 작품 비교해줘' 같은 문장에서
+    제목 후보 두 개를 뽑는다.
+    """
+    if not q:
+        return []
+    q = q.strip()
+
+    # 1) 가장 자주 쓸만한 패턴들
+    patterns = [
+        r"(.+?)(?:와|과|이랑|랑)\s*(.+?)(?:라는 작품|작품 두 개|작품을 두 개|작품 비교)",
+        r"(.+?)(?:와|과|이랑|랑)\s*(.+?)\s*작품\s*비교",
+    ]
+
+    def clean(token: str) -> str:
+        token = token.strip()
+        for josa in ["를", "을", "은", "는", "이", "가", "의"]:
+            if token.endswith(josa):
+                token = token[:-1]
+        return token.strip()
+
+    for pat in patterns:
+        m = re.search(pat, q)
+        if m:
+            left = clean(m.group(1))
+            right = clean(m.group(2))
+            result = [t for t in [left, right] if t]
+            # 두 개 다 있으면 반환
+            if len(result) >= 2:
+                return result
+
+    # 패턴에서 못 찾으면 그냥 비워 둠 (기존 로직 사용)
+    return []
 
 def find_cards_by_title_keyword(
     keyword: str,
@@ -443,39 +506,57 @@ def find_cards_by_artist_keyword(
 
 def extract_subject_from_painting_query(q: str) -> Optional[str]:
     """
-    '참새가 그려진 작품 보여줘', '사람이 그려진 그림 보고싶어'
-    같은 문장에서 '참새', '사람' 같은 '대상'만 뽑기.
+    '참새가 그려진 작품 보여줘', '사람이 나오는 그림',
+    '호박 있는 작품', '호박 그림 보여줘' 등에서
+    핵심 대상을 뽑아낸다.
     """
     if not q:
         return None
     q = q.strip()
 
-    # 자주 나오는 패턴들
+    # 1) 자주 나오는 패턴들
     patterns = [
         "가 그려진", "이 그려진",
         "가 나오는", "이 나오는",
         "가 있는",   "이 있는",
         "이 등장하는", "가 등장하는",
+        "가 보이는", "이 보이는",
     ]
 
     for pat in patterns:
         if pat in q:
             before = q.split(pat)[0].strip()
-            # 혹시 끝에 조사 한 번 더 붙어 있으면 제거
             for josa in ["를", "을", "은", "는", "이", "가", "의"]:
                 if before.endswith(josa):
                     before = before[:-1]
             before = before.strip()
             return before or None
 
-    # 패턴에 안 걸리지만, 대충 '~가 그려진 작품' 형태일 수 있는 경우에 대한 아주 러프한 보정
-    # 예: "참새 그림 보여줘", "사람 그림 보여줘"
+    # 2) '~ 있는 그림/작품/사진' 형태 (조사 생략 버전)
+    #    예: "호박 있는 작품 보여줘"
+    for key in ["그림", "작품", "사진"]:
+        if key in q and "있는" in q:
+            # "호박 있는 작품" 에서 "있는" 앞 단어 하나만 잡기
+            # ... "호박 있는 작품" → ["호박", "있는", "작품"]
+            tokens = q.split()
+            try:
+                idx = tokens.index("있는")
+                if idx > 0:
+                    cand = tokens[idx - 1]
+                    for josa in ["를", "을", "은", "는", "이", "가", "의"]:
+                        if cand.endswith(josa):
+                            cand = cand[:-1]
+                    cand = cand.strip()
+                    if cand:
+                        return cand
+            except ValueError:
+                pass
+
+    # 3) '호박 그림', '참새 그림', '바다 그림' 같은 단순형
     if "그림" in q or "작품" in q or "사진" in q:
-        # '그림', '작품', '사진' 앞 단어 하나만 대충 추출
         for key in ["그림", "작품", "사진"]:
             if key in q:
                 before = q.split(key)[0].strip()
-                # 공백 기준 마지막 토큰만 사용
                 tokens = before.split()
                 if tokens:
                     cand = tokens[-1]
@@ -483,9 +564,73 @@ def extract_subject_from_painting_query(q: str) -> Optional[str]:
                         if cand.endswith(josa):
                             cand = cand[:-1]
                     cand = cand.strip()
-                    return cand or None
+                    if cand:
+                        return cand
 
     return None
+
+
+
+def find_cards_by_caption_keyword(
+    keyword: str,
+    category: Optional[str] = "painting_json",
+    max_results: int = 8,
+) -> List[Dict]:
+    """
+    json_extracted/{category} 아래에서
+    vision_caption_ko 안에 keyword가 포함된 작품들을 찾는다.
+    (chroma_db_text를 다시 만들 필요 없이,
+     JSON 파일만 직접 검색하는 방식)
+    """
+    keyword = (keyword or "").strip()
+    if not keyword:
+        return []
+
+    real_cat = map_category(category or "painting_json")
+    target_dir = JSON_ROOT / real_cat
+    if not target_dir.exists() or not target_dir.is_dir():
+        return []
+
+    matches: List[Dict] = []
+
+    for p in target_dir.glob("*.json"):
+        try:
+            with p.open("r", encoding="utf-8") as f:
+                card = json.load(f)
+        except Exception:
+            continue
+
+        caption = (
+            card.get("vision_caption_ko")
+            or card.get("vision_caption")
+            or card.get("vision_caption_en")
+            or ""
+        )
+
+        if not caption:
+            continue
+
+        if keyword in str(caption):
+            desc = card.get("Description") or {}
+            title_candidates = [
+                card.get("title"),
+                card.get("title_kor"),
+                card.get("title_ko"),
+                card.get("title_eng"),
+                desc.get("ArtTitle_kor"),
+                desc.get("ArtTitle_eng"),
+            ]
+            matches.append(
+                {
+                    "id": p.stem,
+                    "title": next((t for t in title_candidates if t), ""),
+                }
+            )
+
+            if len(matches) >= max_results:
+                break
+
+    return matches
 
 
 # ───────────────────────────────────────────────────────────
@@ -874,6 +1019,120 @@ def build_prompt(card: Dict, context_block: str) -> str:
     ]
     return "\n".join(lines)
 
+def build_immersive_prompt(
+    card: Dict,
+    context_block: str,
+    visual_labels: List[str],
+) -> str:
+    card = card or {}
+    desc = card.get("Description") or {}
+    photo = card.get("Photo_Info") or {}
+    data_info = card.get("Data_Info") or {}
+
+    title = (
+        card.get("title")
+        or desc.get("ArtTitle_kor")
+        or desc.get("ArtTitle_eng")
+        or data_info.get("ImageFileName")
+        or card.get("id", "")
+    )
+
+    artist = (
+        card.get("artist")
+        or desc.get("ArtistName_kor")
+        or desc.get("ArtistName_eng")
+        or ""
+    )
+
+    klass = (
+        card.get("class")
+        or desc.get("Class_kor")
+        or desc.get("Class_eng")
+        or ""
+    )
+
+    material = (
+        card.get("material")
+        or desc.get("Material_kor")
+        or desc.get("Material_eng")
+        or ""
+    )
+
+    year = (
+        card.get("date_or_period")
+        or photo.get("PhotoDate")
+        or desc.get("Period_kor")
+        or desc.get("Period_eng")
+        or ""
+    )
+
+    meta_targets: List[str] = []
+    for s in [
+        title,
+        klass,
+        desc.get("Subject_kor"),
+        desc.get("Subject_eng"),
+        desc.get("Keyword_kor"),
+        desc.get("Keyword_eng"),
+    ]:
+        if s:
+            meta_targets.append(str(s))
+
+    allowed_targets_list = list(dict.fromkeys((visual_labels or []) + meta_targets))
+    labels_str = (
+        ", ".join(allowed_targets_list) if allowed_targets_list else "특별히 추출된 단어 없음"
+    )
+
+    _ = context_block
+
+    lines: List[str] = [
+        "당신은 한국어로 해설하는 미술관 도슨트입니다.",
+        "",
+        "[작품 기본 정보]",
+        f"제목: {title}",
+        f"작가: {artist}",
+        f"분류/장르: {klass}",
+        f"재질: {material}",
+        f"연도/시기: {year}",
+        "",
+        "[이 작품과 직접 관련된 단어 목록]",
+        labels_str,
+        "",
+        "위 목록에는 작품 제목·주제·이미지 분석을 통해 얻은 단어들만 들어 있습니다.",
+        "구체적인 사물 이름(예: 새, 꽃, 금붕어, 사람, 글씨 등)을 말할 때는 가급적 이 목록 안에 실제로 적힌 단어를 그대로 사용하십시오.",
+        "목록에 없는 전혀 다른 사물을 상상해서 새로 추가하지 마십시오.",
+        "",
+        "지침:",
+        "1. 전체 해설을 정확히 3개의 문단으로 작성합니다.",
+        "   - 첫 번째 문단: 작품 전체 분위기와 의미를 2~3문장으로 소개합니다.",
+        "   - 두 번째 문단: 화면 왼쪽, 화면 가운데, 화면 오른쪽을 이 순서대로 언급하지만, 구체적인 사물의 위치를 추측하지 말고, 구도와 시선 흐름을 추상적으로 설명합니다.",
+        "   - 세 번째 문단: 관람자가 느끼면 좋을 감정·메시지·여운을 2~3문장으로 정리합니다.",
+        "2. 첫 번째 문단과 세 번째 문단에서는 '화면 왼쪽', '화면 가운데', '화면 오른쪽', '왼쪽', '가운데', '오른쪽' 같은 방향 표현을 사용하지 마십시오.",
+        "3. 두 번째 문단에서는 반드시 다음 표현을 이 순서대로 한 번씩만 사용합니다: '화면 왼쪽에는', '화면 가운데에는', '화면 오른쪽에는'.",
+        "4. 그러나 두 번째 문단에서도 '호박이 화면 왼쪽에 있다', '글씨가 화면 오른쪽에 있다'처럼 특정 사물과 정확한 위치를 결합해서 말하지 마십시오.",
+        "   대신 '화면 왼쪽에는 조용한 여백이 펼쳐지고', '화면 가운데에는 시선이 머무는 중심 부분이 자리하며', '화면 오른쪽에는 전체 분위기를 정리하는 요소들이 놓여 있는 듯합니다'처럼 추상적인 표현을 사용하십시오.",
+        "5. 글자·문장·주기도문·서예와 관련된 설명을 할 때에는, 그 글자가 화면의 어느 쪽에 있는지 단정해서 말하지 말고 위치 표현 없이 설명하십시오.",
+        "6. 한 문단 안에서는 줄바꿈을 하지 말고, 자연스럽게 한 문단으로 이어서 작성합니다.",
+        "7. 각 문단이 끝날 때마다 한 줄을 완전히 비우고, 다음 문단을 새 줄에서 시작하십시오. (즉, 문단 사이에 빈 줄 한 줄을 넣으십시오.)",
+        "8. 번호, 불릿, 큰따옴표는 출력에 포함하지 말고, 오직 세 개의 문단 텍스트만 출력하십시오.",
+    ]
+
+    if any("새" in t for t in allowed_targets_list):
+        lines.append(
+            "9. 목록에 '새'가 있다면, 적어도 한 문장에서는 새의 모습이나 느낌을 구체적으로 설명하되, 화면의 정확한 위치는 추측하지 마십시오."
+        )
+    if any("물고기" in t or "금붕어" in t for t in allowed_targets_list):
+        lines.append(
+            "10. 목록에 '물고기'나 '금붕어'가 있다면, 적어도 한 문장에서는 물고기의 색감이나 움직임을 설명하되, 화면의 정확한 위치는 추측하지 마십시오."
+        )
+    if any("사람" in t for t in allowed_targets_list):
+        lines.append(
+            "11. 목록에 '사람'이 있다면, 인물의 자세나 표정을 한 문장 이상에서 설명하되, 화면의 어느 쪽에 있는지 단정하지 마십시오."
+        )
+
+    return "\n".join(lines)
+
+
 # ───────────────────────────────────────────────────────────
 # 랜덤 작품 선택 유틸 (Agent fallback 용)
 # ───────────────────────────────────────────────────────────
@@ -973,7 +1232,22 @@ async def curate(req: CurateIn):
         raise HTTPException(status_code=500, detail="Server missing GOOGLE_API_KEY")
 
     card = req.card or {}
+    card_id = req.id or card.get("id")
 
+    # 🔍 디버그 로그 추가
+    print(f"[curate] request id={card_id}")
+
+    # 1) 캐시 먼저 확인
+    if card_id and card_id in CURATION_CACHE:
+        print(f"[curate] CACHE HIT for {card_id}")
+        return {
+            "curator_text": CURATION_CACHE[card_id],
+            "retrieved": [],
+        }
+
+    print(f"[curate] CACHE MISS for {card_id}")
+
+    # 2) 평소처럼 RAG + Gemini 호출
     query = build_query(card)
     hits = retrieve_context(query, k=5)
     context_block = format_context(hits)
@@ -985,6 +1259,10 @@ async def curate(req: CurateIn):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
 
+    # 3) 캐시에 저장
+    if card_id:
+        CURATION_CACHE[card_id] = text
+
     return {
         "curator_text": text,
         "retrieved": [
@@ -992,6 +1270,96 @@ async def curate(req: CurateIn):
             for h in hits
         ],
     }
+
+
+
+@app.post("/curate/immersive")
+async def curate_immersive(req: CurateImmersiveIn):
+    if not API_KEY:
+        raise HTTPException(status_code=500, detail="Server missing GOOGLE_API_KEY")
+    """
+    몰입형(Immersive) 전용 3문단 해설 생성 엔드포인트.
+    Immersive.jsx에서 POST /curate/immersive 로 호출함.
+    """
+    try:
+        # 1) 카드 준비
+        card = req.card or {}
+        if not card and req.id:
+            try:
+                card = load_card_by_id(req.category, req.id)
+            except Exception:
+                return {
+                    "curator_text": "작품 정보를 불러오지 못했습니다.",
+                    "labels": [],
+                }
+
+        # 🔑 이 작품을 구분할 id + 카테고리까지 묶어서 캐시 키 생성
+        card_id = req.id or card.get("id")
+        cache_key = make_immersive_key(card_id, req.category)
+
+        # 2) 캐시 먼저 확인 (카테고리까지 포함된 키 사용)
+        if cache_key and cache_key in IMMERSIVE_CACHE:
+            cached = IMMERSIVE_CACHE[cache_key]
+            return {
+                "curator_text": cached.get("text", ""),
+                "labels": cached.get("labels", []),
+            }
+
+        # 3) (선택) 이미지 분석 라벨 - 현재는 CLIP 안 쓰고 빈 리스트만 사용
+        visual_labels: List[str] = []
+
+        # 4) 몰입형 전용 프롬프트 생성
+        prompt = build_immersive_prompt(card, "", visual_labels)
+
+        # 5) Gemini 호출을 별도 스레드에서 실행 + 타임아웃
+        async def _gemini():
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                None,
+                lambda: model.generate_content(prompt),
+            )
+
+        try:
+            resp = await asyncio.wait_for(_gemini(), timeout=15)
+            text = (resp.text or "").strip()
+
+        except asyncio.TimeoutError:
+            print("❌ Gemini TIMEOUT (immersive)")
+            text = (
+                "이 작품은 전체적으로 고요하면서도 생동감 있는 분위기를 담고 있습니다. "
+                "화면을 천천히 훑어 보며 색감과 구도를 감상해 보세요.\n\n"
+                "화면 왼쪽에는, 화면 가운데에는, 화면 오른쪽에는 각각 다른 요소들이 자리하고 있으니 "
+                "차례로 시선을 옮겨 보시기 바랍니다.\n\n"
+                "지금은 AI 해설이 완전히 생성되지 않았지만, 작품이 주는 여운과 감정을 천천히 느껴 보세요."
+            )
+
+        except Exception as e:
+            print("❌ Gemini ERROR (immersive):", e)
+            text = (
+                "현재 AI 해설을 생성할 수 없습니다. 잠시 후 다시 시도해 주세요.\n\n"
+                "그동안에는 화면 전체를 천천히 살펴보며, 색감과 구도, 등장하는 대상들을 직접 감상해 보시길 권합니다."
+            )
+
+        # 6) 캐시에 저장 (여기서도 cache_key 사용)
+        if cache_key:
+            IMMERSIVE_CACHE[cache_key] = {
+                "text": text,
+                "labels": visual_labels,
+            }
+
+        return {
+            "curator_text": text,
+            "labels": visual_labels,
+        }
+
+    except Exception as e:
+        print("❌ IMMERSIVE UNKNOWN ERROR:", e)
+        return {
+            "curator_text": "해설을 불러오는 중 문제가 발생했습니다.",
+            "labels": [],
+        }
+
+
 
 @app.get("/search")
 def search(q: str, k: int = 5):
@@ -1059,6 +1427,13 @@ def search_image(q: str, k: int = 5):
 # ───────────────────────────────────────────────────────────
 @app.post("/ai/agent")
 async def agent_route(req: AgentIn):
+    """
+    첫 화면(Welcome)에서 자연어 한 줄 입력을 받아
+    - action: "curate" | "compare" | "tts"
+    - primary_id / secondary_id
+    - category
+    를 판단해서 반환하는 라우터.
+    """
     if not API_KEY:
         raise HTTPException(status_code=500, detail="Server missing GOOGLE_API_KEY")
 
@@ -1066,7 +1441,22 @@ async def agent_route(req: AgentIn):
     if not q:
         raise HTTPException(status_code=400, detail="query가 비어 있습니다.")
 
-    # 0) 키워드 먼저 판별
+    # 기본 카테고리
+    fallback_cat = req.category or "painting_json"
+
+    # 🔑 에이전트 캐시 키 (카테고리 + 원문 질의)
+    cache_key = f"{fallback_cat}::{q}"
+
+    # 🔍 캐시 먼저 확인
+    if cache_key in AGENT_CACHE:
+        print(f"[agent_route] CACHE HIT for {cache_key}")
+        return AGENT_CACHE[cache_key]
+
+    print(f"[agent_route] CACHE MISS for {cache_key}")
+
+    # -------------------------------
+    # 0. 쿼리 전처리 및 플래그
+    # -------------------------------
     lower_q = q.lower()
     compare_keywords = ["비교", "두 작품", "두 점", "2점", "vs", "차이"]
     tts_keywords = ["읽어줘", "읽어 줘", "설명 들어보고 싶어", "음성", "tts", "음성으로", "들려줘", "들려 줘"]
@@ -1074,13 +1464,42 @@ async def agent_route(req: AgentIn):
     is_compare = any(kw in lower_q for kw in compare_keywords)
     is_tts = any(kw in lower_q for kw in tts_keywords)
 
-    fallback_cat = req.category or "painting_json"
+    # 👇 아래 있던 fallback_cat = ... 줄은 이제 위로 올라갔으니 삭제!
+    # fallback_cat = req.category or "painting_json"
 
-    # 🔥 0-A) 쿼리에서 '제목 후보' / '작가 후보' 추출
+
+    # 제목 / 작가 / 주제 키워드 추출
     title_kw = extract_title_from_query(q)
     artist_kw = extract_artist_from_query(q)
+    subject_kw = extract_subject_from_painting_query(q)
 
-    # 🔥 0-B) 제목 후보가 있으면, JSON에서 직접 제목 검색
+    # -------------------------------
+    # 0-A. "제목 두 개" 패턴 처리
+    # -------------------------------
+    two_title_kws = extract_two_titles_from_query(q)
+    multi_title_matches: List[Dict] = []
+
+    if two_title_kws:
+        for kw in two_title_kws:
+            ms = find_cards_by_title_keyword(
+                keyword=kw,
+                category=fallback_cat,
+                max_results=1,    # 각 제목당 1개
+            )
+            if ms:
+                multi_title_matches.extend(ms)
+
+        if multi_title_matches:
+            print(
+                "[agent_route] multi title match:",
+                two_title_kws,
+                "->",
+                [m["id"] for m in multi_title_matches],
+            )
+
+    # -------------------------------
+    # 0-B. 제목 직접 매칭
+    # -------------------------------
     direct_title_matches: List[Dict] = []
     if title_kw:
         direct_title_matches = find_cards_by_title_keyword(
@@ -1089,10 +1508,16 @@ async def agent_route(req: AgentIn):
             max_results=3,
         )
         if direct_title_matches:
-            print("[agent_route] direct title match:", title_kw,
-                  "->", [m["id"] for m in direct_title_matches])
+            print(
+                "[agent_route] direct title match:",
+                title_kw,
+                "->",
+                [m["id"] for m in direct_title_matches],
+            )
 
-    # 🔥 0-C) 작가 후보가 있으면, JSON에서 직접 작가 검색
+    # -------------------------------
+    # 0-C. 작가 직접 매칭
+    # -------------------------------
     direct_artist_matches: List[Dict] = []
     if artist_kw:
         direct_artist_matches = find_cards_by_artist_keyword(
@@ -1101,13 +1526,37 @@ async def agent_route(req: AgentIn):
             max_results=5,
         )
         if direct_artist_matches:
-            print("[agent_route] direct artist match:", artist_kw,
-                  "->", [m["id"] for m in direct_artist_matches])
+            print(
+                "[agent_route] direct artist match:",
+                artist_kw,
+                "->",
+                [m["id"] for m in direct_artist_matches],
+            )
 
-    # 🔥 0-D) 비교/음성 요청이 아니고, 제목 직접 매치가 있으면 → 바로 curate
+    # -------------------------------
+    # 0-D. Vision 캡션(장면) 매칭
+    # -------------------------------
+    caption_matches: List[Dict] = []
+    if subject_kw:
+        caption_matches = find_cards_by_caption_keyword(
+            keyword=subject_kw,
+            category=fallback_cat,
+            max_results=5,
+        )
+        if caption_matches:
+            print(
+                "[agent_route] caption match:",
+                subject_kw,
+                "->",
+                [m["id"] for m in caption_matches],
+            )
+
+    # -------------------------------
+    # 0-E. 비교/tts가 아닌 경우의 빠른 단일 추천
+    # -------------------------------
     if direct_title_matches and not is_compare and not is_tts:
         primary_id = direct_title_matches[0]["id"]
-        return {
+        result = {
             "action": "curate",
             "primary_id": primary_id,
             "secondary_id": None,
@@ -1115,12 +1564,13 @@ async def agent_route(req: AgentIn):
             "reason": f"'{title_kw}'라는 작품 제목과 일치하는 작품을 직접 찾아 추천했습니다.",
             "candidates": direct_title_matches,
         }
+        AGENT_CACHE[cache_key] = result
+        return result
 
-    # 🔥 0-E) 비교/음성 요청이 아니고, 작가 직접 매치가 있으면
-    #         해당 작가의 작품들 중 하나를 골라서 보여줌
+
     if direct_artist_matches and not is_compare and not is_tts:
         primary_id = direct_artist_matches[0]["id"]
-        return {
+        result = {
             "action": "curate",
             "primary_id": primary_id,
             "secondary_id": None,
@@ -1128,16 +1578,32 @@ async def agent_route(req: AgentIn):
             "reason": f"'{artist_kw}' 작가의 작품 중 하나를 직접 찾아 추천했습니다.",
             "candidates": direct_artist_matches,
         }
+        AGENT_CACHE[cache_key] = result
+        return result
 
-    # 1) 의미 검색 (후보 작품 리스트)
-    #    - 텍스트 RAG(Gemini) + 이미지 RAG(CLIP) 둘 다에서 후보를 가져와 합침
-    text_hits = retrieve_context(q, k=4)          # 메타데이터 기반
-    image_hits = retrieve_image_context(q, k=4)   # 시각적/스타일 기반
+    if caption_matches and not is_compare and not is_tts:
+        primary_id = caption_matches[0]["id"]
+        result = {
+            "action": "curate",
+            "primary_id": primary_id,
+            "secondary_id": None,
+            "category": fallback_cat,
+            "reason": f"'{subject_kw}'이(가) 들어간 장면이 Vision 캡션에 포함된 작품을 직접 찾아 추천했습니다.",
+            "candidates": caption_matches,
+        }
+        AGENT_CACHE[cache_key] = result
+        return result
+
+    # -------------------------------
+    # 1. 의미 검색 (텍스트 RAG + 이미지 RAG)
+    # -------------------------------
+    text_hits = retrieve_context(q, k=4)
+    image_hits = retrieve_image_context(q, k=4)
 
     candidates: List[Dict] = []
     seen_ids = set()
 
-    # 우선 텍스트 RAG 결과
+    # 텍스트 RAG 결과
     for h in text_hits:
         m = h.get("meta") or {}
         cid = h.get("id")
@@ -1155,7 +1621,7 @@ async def agent_route(req: AgentIn):
             }
         )
 
-    # 그 다음 이미지 RAG 결과 (중복 id는 건너뜀)
+    # 이미지 RAG 결과
     for h in image_hits:
         m = h.get("meta") or {}
         cid = h.get("id")
@@ -1174,70 +1640,115 @@ async def agent_route(req: AgentIn):
         )
 
     print("[agent_route] query:", q)
-    print("[agent_route] candidates:", [c["id"] for c in candidates])
+    print("[agent_route] candidates(before filter):", [c["id"] for c in candidates])
 
-    # 🔥 현재 카테고리(fallback_cat)에서 JSON 카드가 실제로 있는 후보만 남기기
+    # 실제 JSON이 있는 id만 남기기
     candidates = filter_candidates_by_category(candidates, fallback_cat)
-
     print("[agent_route] candidates(after filter):", [c["id"] for c in candidates])
 
-    # 2) '비교' 요청이면 → hits가 없어도 무조건 compare로
+    # -------------------------------
+    # 2. 비교 요청
+    # -------------------------------
     if is_compare:
         selected_ids: List[str] = []
 
-        # 검색 결과에서 먼저 채우고
-        for c in candidates:
-            if c["id"] and c["id"] not in selected_ids:
-                selected_ids.append(c["id"])
-            if len(selected_ids) >= 2:
-                break
+        # 2-0) 제목 두 개 명시 → 우선
+        if multi_title_matches:
+            for m in multi_title_matches:
+                cid = m.get("id")
+                if cid and cid not in selected_ids:
+                    selected_ids.append(cid)
+                if len(selected_ids) >= 2:
+                    break
 
-        # 부족하면 랜덤으로 채우기
+        # 2-1) 작가 직접 매치 → 그 중 2점
+        if len(selected_ids) < 2 and direct_artist_matches:
+            for c in direct_artist_matches:
+                cid = c.get("id")
+                if cid and cid not in selected_ids:
+                    selected_ids.append(cid)
+                if len(selected_ids) >= 2:
+                    break
+
+        # 2-2) 그래도 부족하면 의미검색 후보에서 채우기
+        if len(selected_ids) < 2:
+            for c in candidates:
+                cid = c.get("id")
+                if cid and cid not in selected_ids:
+                    selected_ids.append(cid)
+                if len(selected_ids) >= 2:
+                    break
+
+        # 2-3) 그래도 모자라면 랜덤
         while len(selected_ids) < 2:
             rnd = pick_random_id(fallback_cat)
             if rnd and rnd not in selected_ids:
                 selected_ids.append(rnd)
 
         primary_id, secondary_id = selected_ids[0], selected_ids[1]
-
         print("[agent_route] forced compare:", primary_id, secondary_id)
-        return {
+
+        if multi_title_matches:
+            reason = (
+                f"사용자가 제목으로 지목한 '{two_title_kws[0]}'와(과) "
+                f"'{two_title_kws[1]}' 작품을 우선 선택해 비교합니다."
+            )
+        elif direct_artist_matches:
+            reason = (
+                f"사용자가 '{artist_kw}' 작가의 작품 비교를 요청해서 "
+                "해당 작가의 작품을 우선적으로 두 점 선택했습니다."
+            )
+        else:
+            reason = "사용자가 비교를 요청해서 관련성이 높은 두 작품을 선택했습니다."
+
+        result = {
             "action": "compare",
             "primary_id": primary_id,
             "secondary_id": secondary_id,
             "category": fallback_cat,
-            "reason": "사용자가 비교를 요청해서 두 작품을 선택했습니다.",
+            "reason": reason,
             "candidates": candidates,
         }
+        AGENT_CACHE[cache_key] = result
+        return result
 
-    # 3) TTS 요청이면 → '제목/작가 직접 매치'를 최우선으로 사용
+
+    # -------------------------------
+    # 3. TTS 요청
+    # -------------------------------
     if is_tts:
         primary_id = None
         tts_candidates: List[Dict] = []
 
-        # 3-1) 제목 직접 매치가 있으면 그걸 우선 사용
         if direct_title_matches:
             primary_id = direct_title_matches[0]["id"]
             tts_candidates = direct_title_matches
             reason = f"'{title_kw}'라는 작품 제목과 일치하는 작품을 찾아 음성 설명을 재생합니다."
-        # 3-2) 없으면, 작가 직접 매치가 있으면 사용
+
         elif direct_artist_matches:
             primary_id = direct_artist_matches[0]["id"]
             tts_candidates = direct_artist_matches
             reason = f"'{artist_kw}' 작가의 작품 중 하나를 선택해 음성 설명을 재생합니다."
-        # 3-3) 그것도 없으면, 일반 RAG 후보 사용
+
+        # 🆕 vision_caption_ko 기반 매칭도 TTS에 사용
+        elif caption_matches:
+            primary_id = caption_matches[0]["id"]
+            tts_candidates = caption_matches
+            reason = f"'{subject_kw}'이(가) 포함된 장면이 Vision 캡션에 있는 작품을 선택해 음성 설명을 재생합니다."
+
         elif candidates:
             primary_id = candidates[0]["id"]
             tts_candidates = candidates
             reason = "의미검색 결과 중 가장 관련성이 높은 작품으로 음성 설명을 재생합니다."
-        # 3-4) 아무것도 없으면 랜덤
+
         else:
             primary_id = pick_random_id(fallback_cat)
             tts_candidates = []
             reason = "검색 결과가 없어 임의의 작품으로 음성 설명을 재생합니다."
 
         print("[agent_route] forced tts:", primary_id)
-        return {
+
+        result = {
             "action": "tts",
             "primary_id": primary_id,
             "secondary_id": None,
@@ -1245,11 +1756,16 @@ async def agent_route(req: AgentIn):
             "reason": reason,
             "candidates": tts_candidates,
         }
+        AGENT_CACHE[f"{fallback_cat}::{q}"] = result  # 캐시도 쓰고 있다면 이렇게
+        return result
 
-    # 4) 여기까지 왔는데 후보가 하나도 없으면 그냥 랜덤 curate
+
+    # -------------------------------
+    # 4. 후보가 하나도 없으면 랜덤 curate
+    # -------------------------------
     if not candidates:
         rnd_id = pick_random_id(fallback_cat)
-        return {
+        result = {
             "action": "curate",
             "primary_id": rnd_id,
             "secondary_id": None,
@@ -1257,15 +1773,19 @@ async def agent_route(req: AgentIn):
             "reason": "의미검색 결과가 없어, 임의의 작품을 추천했습니다.",
             "candidates": [],
         }
+        AGENT_CACHE[cache_key] = result
+        return result
 
-    # 5) 나머지 일반 케이스는 LLM에게 맡김 (기존 로직 그대로)
+    # -------------------------------
+    # 5. 일반 케이스: LLM에게 action 선택을 맡김
+    # -------------------------------
     prompt_lines = [
         "당신은 미술관 AI 서비스의 '라우팅 에이전트'입니다.",
         "사용자의 한 줄 요청을 보고, 아래 세 가지 중 어떤 기능으로 보내면 좋을지 결정하세요.",
         "",
-        "1) 'curate': 특정 작품 하나에 대한 큐레이터 설명을 보여주는 화면 (상세 화면)으로 보냄.",
-        "2) 'compare': 두 작품을 나란히 비교해 주는 화면으로 보냄.",
-        "3) 'tts': 작품 하나의 설명을 들려주는 TTS 중심 화면으로 보냄. (실제 라우팅은 상세 화면과 동일).",
+        "1) 'curate': 특정 작품 하나에 대한 큐레이터 설명을 보여주는 화면 (상세 화면).",
+        "2) 'compare': 두 작품을 나란히 비교해 주는 화면.",
+        "3) 'tts': 작품 하나의 설명을 들려주는 TTS 중심 화면 (라우팅은 상세 화면과 동일).",
         "",
         "반드시 아래 JSON 형식만, 순수 JSON으로 출력하세요.",
         "{",
@@ -1293,12 +1813,35 @@ async def agent_route(req: AgentIn):
     try:
         resp = model.generate_content(prompt)
         raw = (resp.text or "").strip()
+        print("[agent_route] LLM raw:", raw)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Agent generation failed: {e}")
+        print("[agent_route] LLM error:", e)
+        if candidates:
+            result = {
+                "action": "curate",
+                "primary_id": candidates[0]["id"],
+                "secondary_id": None,
+                "category": fallback_cat,
+                "reason": "에이전트 모델 호출에 실패해서 첫 번째 후보를 기본 추천으로 사용했습니다.",
+                "candidates": candidates,
+            }
+        else:
+            result = {
+                "action": "curate",
+                "primary_id": pick_random_id(fallback_cat),
+                "secondary_id": None,
+                "category": fallback_cat,
+                "reason": "에이전트 모델 호출에 실패해서 임의의 작품을 추천했습니다.",
+                "candidates": [],
+            }
+
+        AGENT_CACHE[cache_key] = result
+        return result
 
     try:
         parsed = json.loads(raw)
     except Exception:
+        print("[agent_route] JSON parse failed, fallback to first candidate")
         parsed = {
             "action": "curate",
             "primary_id": candidates[0]["id"],
@@ -1306,6 +1849,7 @@ async def agent_route(req: AgentIn):
             "category": fallback_cat,
             "reason": "LLM 응답을 파싱하지 못해 첫 번째 후보를 기본 추천으로 사용했습니다.",
         }
+
 
     action = parsed.get("action") or "curate"
     primary_id = parsed.get("primary_id")
@@ -1316,7 +1860,7 @@ async def agent_route(req: AgentIn):
     if not primary_id and candidates:
         primary_id = candidates[0]["id"]
 
-    return {
+    result = {
         "action": action,
         "primary_id": primary_id,
         "secondary_id": secondary_id,
@@ -1324,6 +1868,9 @@ async def agent_route(req: AgentIn):
         "reason": reason,
         "candidates": candidates,
     }
+    AGENT_CACHE[cache_key] = result
+    return result
+
 
 # ───────────────────────────────────────────────────────────
 # 비교문 생성 엔드포인트
@@ -1459,7 +2006,6 @@ async def tts_route(req: TtsIn):
 
     # 프론트에서 넘어온 값 정리
     language_code = (req.language_code or "ko-KR").strip()
-
     voice_name = (req.voice_name or "").strip() or "ko-KR-Wavenet-A"
 
     # 백엔드에서는 기본 1.0으로 두고, 실제 배속은 브라우저 audio.playbackRate로 제어
@@ -1474,6 +2020,15 @@ async def tts_route(req: TtsIn):
     if speaking_rate > 2.0:
         speaking_rate = 2.0
 
+    # 🔑 캐시 키: (언어, 보이스, 속도, 텍스트 md5)
+    text_hash = md5(text.encode("utf-8")).hexdigest()
+    cache_key = f"{language_code}|{voice_name}|{speaking_rate:.2f}|{text_hash}"
+
+    # 1) 캐시 먼저 확인
+    if cache_key in TTS_CACHE:
+        return {"audio_b64": TTS_CACHE[cache_key]}
+
+    # 2) Google TTS 호출
     try:
         client = texttospeech.TextToSpeechClient()
 
@@ -1496,11 +2051,16 @@ async def tts_route(req: TtsIn):
         )
 
         audio_b64 = base64.b64encode(response.audio_content).decode("utf-8")
+
+        # 3) 캐시에 저장
+        TTS_CACHE[cache_key] = audio_b64
+
         return {"audio_b64": audio_b64}
 
     except Exception as e:
         print("[/ai/tts] error:", e)
         raise HTTPException(status_code=500, detail=f"TTS 실패: {e}")
+
 
 # ───────────────────────────────────────────────────────────
 # 유사한 이미지 엔드포인트

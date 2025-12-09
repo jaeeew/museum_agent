@@ -24,30 +24,33 @@ export default function Immersive() {
   const [error, setError] = useState("")
 
   // ---------- TTS / 오디오 상태 ----------
-  const [segments, setSegments] = useState([]) // [{ text, step }]
-  const [activeIndex, setActiveIndex] = useState(-1) // 현재 읽는 문장 인덱스
-  const [segmentTimings, setSegmentTimings] = useState([]) // [{start, end}]
+  const [segments, setSegments] = useState([]) // [{ text, step, paragraph }]
+  const [activeIndex, setActiveIndex] = useState(-1)
+  const [segmentTimings, setSegmentTimings] = useState([])
 
   const [audioUrl, setAudioUrl] = useState(null)
   const audioRef = useRef(null)
 
-  const [audioLoading, setAudioLoading] = useState(false) // TTS 생성 중
-  const [audioReady, setAudioReady] = useState(false) // 오디오 준비 완료
+  const [audioLoading, setAudioLoading] = useState(false)
+  const [audioReady, setAudioReady] = useState(false)
   const [isPlaying, setIsPlaying] = useState(false)
   const [speechRate, setSpeechRate] = useState(1.0)
 
-  // 🔥 이미지 크게 보여줄지 여부
+  // 이미지 크게 보여줄지 여부
   const [immersiveMode, setImmersiveMode] = useState(false)
 
-  // 음성 타입 실제 Google TTS voice_name
+  // 👉 추가: 도슨트(어두운 조명) 모드 여부
+  const [docentMode, setDocentMode] = useState(false)
+
+  // 음성 타입
   const [voiceType, setVoiceType] = useState("bright") // "bright" | "calm"
   const [voiceName, setVoiceName] = useState("ko-KR-Wavenet-A")
 
   // 화면 이동용
-  const [tourStep, setTourStep] = useState(0) // 0~4 단계 (이미지 패닝용)
+  const [tourStep, setTourStep] = useState(0) // 0~4
   const imageContainerRef = useRef(null)
 
-  // 카테고리 → 실제 JSON 폴더 매핑
+  // 카테고리 → 실제 JSON 폴더
   const CATEGORY_MAP = {
     painting_json: "TL_01. 2D_02.회화(Json)",
     craft_json: "TL_01. 2D_04.공예(Json)",
@@ -56,20 +59,16 @@ export default function Immersive() {
 
   const realFolder = CATEGORY_MAP[category] || category
 
-  // ----------------------------------------
   // 0. 음성 타입 → voiceName 매핑
-  // ----------------------------------------
   useEffect(() => {
     if (voiceType === "bright") {
-      setVoiceName("ko-KR-Wavenet-A") // 밝은 톤
+      setVoiceName("ko-KR-Wavenet-A")
     } else {
-      setVoiceName("ko-KR-Wavenet-C") // 차분한 톤
+      setVoiceName("ko-KR-Wavenet-C")
     }
   }, [voiceType])
 
-  // ----------------------------------------
-  // 1. 작품 / 이미지 / 해설문 불러오기
-  // ----------------------------------------
+  // 1. 카드 / 해설 / 이미지 로드
   useEffect(() => {
     if (!id) return
 
@@ -93,11 +92,15 @@ export default function Immersive() {
         if (cancelled) return
         setCard(cardJson)
 
-        // 2) AI 큐레이션
-        const curateRes = await fetch(`${API}/curate`, {
+        // 2) AI 큐레이션 (몰입형 해설)
+        const curateRes = await fetch(`${API}/curate/immersive`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ id, card: cardJson }),
+          body: JSON.stringify({
+            id,
+            category,
+            card: cardJson,
+          }),
         })
         if (!curateRes.ok) {
           const msg = await curateRes.text().catch(() => "")
@@ -120,10 +123,8 @@ export default function Immersive() {
       } catch (e) {
         console.error(e)
         if (!cancelled) {
-          setError(
-            e.message ||
-              "작품 정보를 불러오는 중 문제가 발생했습니다. 다른 작품을 선택해 주세요."
-          )
+          setError("서버 응답 오류: " + (e.message || "네트워크 오류"))
+          setLoading(false)
         }
       } finally {
         if (!cancelled) setLoading(false)
@@ -131,15 +132,12 @@ export default function Immersive() {
     }
 
     run()
-
     return () => {
       cancelled = true
     }
-  }, [id, realFolder])
+  }, [id, realFolder, category])
 
-  // ----------------------------------------
-  // 2. 큐레이션 텍스트 → 문장 세그먼트 분리
-  // ----------------------------------------
+  // 2. 해설 텍스트 → (문단, 문장) 세그먼트 + 화면 step
   useEffect(() => {
     if (!curation) {
       setSegments([])
@@ -147,81 +145,86 @@ export default function Immersive() {
       return
     }
 
-    const rawSentences = curation
-      .split(/(?<=[\.!?])\s+|\n+/) // 마침표/느낌표/줄바꿈 기준
-      .map((s) => s.trim())
+    // 1) 먼저 문단 기준으로 나누기 (빈 줄 == 문단 구분)
+    const paragraphs = curation
+      .split(/\n\s*\n/) // "\n\n" 기준
+      .map((p) => p.trim())
       .filter(Boolean)
 
-    const mapped = rawSentences.map((text, idx) => {
-      const hasLeft =
-        text.includes("왼쪽") || text.includes("좌측") || text.includes("왼편")
-      const hasRight =
-        text.includes("오른쪽") ||
-        text.includes("우측") ||
-        text.includes("오른편")
-      const hasCenter =
-        text.includes("가운데") ||
-        text.includes("중앙") ||
-        text.includes("한가운데")
-      const hasTop =
-        text.includes("위쪽") || text.includes("윗부분") || text.includes("상단")
-      const hasBottom =
-        text.includes("아래") ||
-        text.includes("하단") ||
-        text.includes("아랫부분")
+    const newSegments = []
 
-      const mentionsFlower =
-        text.includes("꽃") ||
-        text.includes("꽃잎") ||
-        text.includes("꽃송이") ||
-        text.includes("꽃이")
-      const mentionsBranch =
-        text.includes("가지") ||
-        text.includes("나뭇가지") ||
-        text.includes("줄기")
-      const mentionsText =
-        text.includes("글씨") ||
-        text.includes("문장") ||
-        text.includes("서예") ||
-        text.includes("글자")
+    paragraphs.forEach((paragraphText, pIndex) => {
+      // 2) 각 문단을 문장 단위로 나누기
+      const sentenceParts = paragraphText
+        .split(/(?<=[\.!?])\s+/) // 마침표/느낌표/물음표 뒤 공백
+        .map((s) => s.trim())
+        .filter(Boolean)
 
-      let step = 0
+      sentenceParts.forEach((text, idx) => {
+        const hasLeft =
+          text.includes("화면 왼쪽") ||
+          text.includes("왼쪽") ||
+          text.includes("좌측") ||
+          text.includes("왼편")
 
-      if (idx === 0) {
-        step = 0
-      } else if (hasLeft && hasBottom) {
-        step = 1
-      } else if (hasLeft) {
-        step = 1
-      } else if (hasRight && hasTop) {
-        step = 3
-      } else if (hasRight) {
-        step = 3
-      } else if (hasCenter) {
-        step = 2
-      } else if (hasTop) {
-        step = 3
-      } else if (hasBottom) {
-        step = 1
-      } else if (mentionsText) {
-        step = 3
-      } else if (mentionsFlower || mentionsBranch) {
-        step = 1
-      } else {
-        step = 4
-      }
+        const hasRight =
+          text.includes("화면 오른쪽") ||
+          text.includes("오른쪽") ||
+          text.includes("우측") ||
+          text.includes("오른편")
 
-      return { text, step }
+        const hasCenter =
+          text.includes("화면 가운데") ||
+          text.includes("그림 가운데") ||
+          text.includes("중앙") ||
+          text.includes("한가운데")
+
+        const hasTop =
+          text.includes("위쪽") ||
+          text.includes("윗부분") ||
+          text.includes("상단")
+
+        const hasBottom =
+          text.includes("아래쪽") ||
+          text.includes("아랫부분") ||
+          text.includes("하단")
+
+        let step = 0
+        if (pIndex === 0) {
+          // 1문단은 항상 전체 보기
+          step = 0
+        } else if (hasLeft && hasBottom) {
+          step = 1
+        } else if (hasLeft) {
+          step = 1
+        } else if (hasRight && hasTop) {
+          step = 3
+        } else if (hasRight) {
+          step = 3
+        } else if (hasCenter) {
+          step = 2
+        } else if (hasTop) {
+          step = 3
+        } else if (hasBottom) {
+          step = 1
+        } else {
+          step = 4 // 방향 언급 없으면 살짝 확대
+        }
+
+        newSegments.push({
+          text,
+          step,
+          paragraph: pIndex,
+        })
+      })
     })
 
-    setSegments(mapped)
+    setSegments(newSegments)
     setActiveIndex(-1)
     setSegmentTimings([])
   }, [curation])
 
-  // ----------------------------------------
-  // 3. 큐레이션 + voiceName → Google TTS 호출
-  // ----------------------------------------
+  // 3. TTS 생성
   useEffect(() => {
     if (!curation) return
 
@@ -243,7 +246,7 @@ export default function Immersive() {
             text: curation,
             language_code: "ko-KR",
             voice_name: voiceName,
-            speaking_rate: 1.0, // 실제 재생 속도는 브라우저 playbackRate로 제어
+            speaking_rate: 1.0,
           }),
         })
 
@@ -270,15 +273,12 @@ export default function Immersive() {
     }
 
     run()
-
     return () => {
       cancelled = true
     }
   }, [curation, voiceName])
 
-  // ----------------------------------------
-  // 4. 오디오 메타데이터 로드되면 → 문장별 시간 구간 대략 매핑
-  // ----------------------------------------
+  // 4. 오디오 메타데이터 → 문장별 시간 추정
   const handleLoadedMetadata = () => {
     const el = audioRef.current
     if (!el || !segments.length) return
@@ -319,10 +319,11 @@ export default function Immersive() {
   const handleEnded = () => {
     setIsPlaying(false)
     setActiveIndex(-1)
-    setImmersiveMode(false) // 재생 끝나면 원래 크기
+    setImmersiveMode(false)
+    setDocentMode(false)   // 👈 추가
   }
 
-  // activeIndex → tourStep (이미지 패닝)
+  // activeIndex → tourStep
   useEffect(() => {
     if (activeIndex < 0 || !segments.length) {
       setTourStep(0)
@@ -331,16 +332,15 @@ export default function Immersive() {
     setTourStep(segments[activeIndex].step)
   }, [activeIndex, segments])
 
-  // ----------------------------------------
-  // 5. 재생 컨트롤 (Play / Pause / Stop / Rate)
-  // ----------------------------------------
+  // 5. 재생 컨트롤
   const handlePlay = async () => {
     if (!audioRef.current || !audioUrl) return
     try {
       audioRef.current.playbackRate = speechRate
       await audioRef.current.play()
       setIsPlaying(true)
-      setImmersiveMode(true) // 🔥 투어 시작하면 크게
+      setImmersiveMode(true)
+      setDocentMode(true)
     } catch (e) {
       console.error(e)
     }
@@ -350,7 +350,6 @@ export default function Immersive() {
     if (!audioRef.current) return
     audioRef.current.pause()
     setIsPlaying(false)
-    // 일시정지는 immersiveMode 유지
   }
 
   const handleStop = () => {
@@ -359,7 +358,8 @@ export default function Immersive() {
     audioRef.current.currentTime = 0
     setIsPlaying(false)
     setActiveIndex(-1)
-    setImmersiveMode(false) // 정지하면 원래 크기
+    setImmersiveMode(false)
+    setDocentMode(false)   // 👈 추가: 조명 모드 OFF
   }
 
   const handleChangeRate = (rate) => {
@@ -369,32 +369,35 @@ export default function Immersive() {
     }
   }
 
-  // ----------------------------------------
-  // 6. 이미지 패닝 스타일
-  // ----------------------------------------
+  // 6. 이미지 패닝 스타일 (줌을 조금만 쓰기)
   const getPanStyle = () => {
     switch (tourStep) {
       case 1:
+        // 왼쪽/아래쪽 강조
         return {
-          transform: "scale(1.4) translate(-10%, 5%)",
+          transform: "scale(1.25) translate(-8%, 4%)",
           transformOrigin: "left bottom",
         }
       case 2:
+        // 가운데
         return {
-          transform: "scale(1.4) translate(0%, 0%)",
+          transform: "scale(1.35) translate(0%, 0%)",
           transformOrigin: "center center",
         }
       case 3:
+        // 오른쪽/위쪽
         return {
-          transform: "scale(1.4) translate(10%, -5%)",
+          transform: "scale(1.25) translate(8%, -4%)",
           transformOrigin: "right top",
         }
       case 4:
+        // 살짝 확대된 전체
         return {
-          transform: "scale(1.2)",
+          transform: "scale(1.1)",
           transformOrigin: "center center",
         }
       default:
+        // 기본: 전체 보기
         return {
           transform: "scale(1.0)",
           transformOrigin: "center center",
@@ -402,12 +405,10 @@ export default function Immersive() {
     }
   }
 
-  // ----------------------------------------
   // 7. 화면 렌더링
-  // ----------------------------------------
   if (loading) {
     return (
-      <PageLayout wide={immersiveMode}>
+      <PageLayout wide={immersiveMode} docentMode={docentMode}>
         <div
           style={{
             minHeight: "60vh",
@@ -420,9 +421,7 @@ export default function Immersive() {
           <p style={{ fontSize: 18, marginBottom: 8 }}>
             몰입형 작품 감상을 준비하고 있어요...
           </p>
-          <p style={{ fontSize: 14, color: "#6b7280" }}>
-            잠시만 기다려 주세요.
-          </p>
+          <p style={{ fontSize: 14, color: "#6b7280" }}>잠시만 기다려 주세요.</p>
         </div>
       </PageLayout>
     )
@@ -430,7 +429,7 @@ export default function Immersive() {
 
   if (error) {
     return (
-      <PageLayout wide={immersiveMode}>
+      <PageLayout wide={immersiveMode} docentMode={docentMode}>
         <div
           style={{
             minHeight: "60vh",
@@ -559,7 +558,7 @@ export default function Immersive() {
             <div
               style={{
                 width: "100%",
-                maxWidth: immersiveMode ? 1200 : 650,
+                maxWidth: immersiveMode ? 1100 : 620,
                 aspectRatio: immersiveMode ? "16 / 9" : "4 / 3",
                 borderRadius: 22,
                 overflow: "hidden",
@@ -851,7 +850,7 @@ export default function Immersive() {
           </div>
         </div>
 
-        {/* 하단: 텍스트 해설 전문 (현재 문장 하이라이트) */}
+        {/* 하단: 텍스트 해설 (현재 문장 하이라이트, 문단 유지) */}
         <div
           style={{
             marginTop: 10,
@@ -879,17 +878,30 @@ export default function Immersive() {
             }}
           >
             {segments.length ? (
-              segments.map((seg, idx) => (
-                <span
-                  key={idx}
-                  style={{
-                    fontWeight: idx === activeIndex ? 700 : 400,
-                    color: idx === activeIndex ? "#1d4ed8" : "#374151",
-                  }}
-                >
-                  {seg.text + " "}
-                </span>
-              ))
+              segments.map((seg, idx) => {
+                const prev = idx > 0 ? segments[idx - 1] : null
+                const isNewParagraph =
+                  !prev || prev.paragraph !== seg.paragraph
+
+                return (
+                  <React.Fragment key={idx}>
+                    {isNewParagraph && idx !== 0 && (
+                      <>
+                        <br />
+                        <br />
+                      </>
+                    )}
+                    <span
+                      style={{
+                        fontWeight: idx === activeIndex ? 700 : 400,
+                        color: idx === activeIndex ? "#1d4ed8" : "#374151",
+                      }}
+                    >
+                      {seg.text}
+                    </span>{" "}
+                  </React.Fragment>
+                )
+              })
             ) : (
               curation || "이 작품에 대한 설명을 불러오지 못했습니다."
             )}
@@ -900,21 +912,21 @@ export default function Immersive() {
   )
 }
 
-// ==============================
-// 공통 레이아웃 컴포넌트
-// ==============================
-function PageLayout({ children, wide = false }) {
+// 공통 레이아웃
+function PageLayout({ children, wide = false, docentMode = false }) {
   const navigate = useNavigate()
 
   return (
     <div
-      style={{
-        minHeight: "100vh",
-        background:
-          "linear-gradient(to bottom, #fdfaf5 0%, #f5eee3 40%, #f5f3ee 100%)",
-        padding: "24px 16px 40px",
-        boxSizing: "border-box",
-      }}
+    style={{
+      minHeight: "100vh",
+      background: docentMode
+        ? "radial-gradient(circle at top, #111827 0%, #020617 50%, #000000 100%)"
+        : "linear-gradient(to bottom, #fdfaf5 0%, #f5eee3 40%, #f5f3ee 100%)",
+      padding: "24px 16px 40px",
+      boxSizing: "border-box",
+      transition: "background 0.5s ease",  // 👈 부드럽게 전환
+    }}
     >
       <div
         style={{

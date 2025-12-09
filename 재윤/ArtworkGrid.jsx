@@ -3,7 +3,7 @@
 import React, { useEffect, useState } from "react"
 import { useNavigate, useSearchParams } from "react-router-dom"
 
-const API = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000"
+const API = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8001"
 
 const CATEGORY_MAP = {
    "painting_json": "TL_01. 2D_02.회화(Json)",
