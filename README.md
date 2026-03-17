@@ -1,4 +1,4 @@
-# museum_agent🏛️ Museum Agent
+🏛️ Museum Agent
 ✨ 개요
 
 Museum Agent는 멀티모달 RAG 기반 AI 도슨트 시스템입니다.
@@ -10,3 +10,36 @@ AI가 생성한 작품 해설을 듣거나, 유사 작품을 추천받고,
 기존 전시 서비스가 단순한 이미지와 텍스트 설명 중심이었다면
 Museum Agent는 텍스트 RAG + 이미지 RAG + Vision 모델을 결합하여
 사용자의 질문과 의도에 맞는 지능형 전시 해설 서비스를 제공합니다.
+
+📂 데이터
+
+프로젝트에서는 AI Hub 디지털 K-Art 데이터셋을 활용했습니다.
+
+데이터 구성
+
+이미지 데이터
+
+약 92,547장 작품 이미지 (JPG)
+
+메타데이터
+
+작품 제목
+
+작가
+
+시대
+
+소재
+
+작품 설명
+
+메타데이터 예시
+{
+  "MainCategory": "현대",
+  "SubCategory": "한국화",
+  "Title": "Intention",
+  "ArtistName": "김영재",
+  "Material": "종이"
+}
+
+이미지와 메타데이터를 결합하여 텍스트 RAG 및 이미지 RAG 검색을 수행합니다.
