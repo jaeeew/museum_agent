@@ -129,4 +129,34 @@ AI / Data
 ```
 
 ## 🖥️ 서비스 실행 화면
+### 🏠 메인 갤러리
+- 작품 리스트 및 필터링 제공
+<p align="center">
+  <img src="./assets/gallery.png" width="400"/>
+</p>
+
+### 📄 작품 상세 페이지
+- AI 해설 + 유사 작품 추천
+<p align="center">
+  <img src="./assets/detail.png" width="400"/>
+</p>
+
+### 🎧 몰입형 감상
+- TTS 기반 음성 해설 + 인터랙션
+<p align="center">
+  <img src="./assets/immersive.png" width="400"/>
+</p>
+
+### 🔍 작품 비교 기능
+- 두 작품의 스타일/맥락 비교 분석
+<p align="center">
+  <img src="./assets/compare.png" width="400"/>
+</p>
+
+## 🤝 협업 방식
+
+- 역할 분담 기반 병렬 개발
+- API 명세 기반 프론트-백엔드 협업
+- GitHub PR 및 코드 리뷰 진행
+- Notion 기반 일정 및 기능 관리
 
